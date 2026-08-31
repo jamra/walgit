@@ -80,6 +80,24 @@ type GCResult struct {
 	Checkpoints int `json:"checkpoints"`
 }
 
+func cloneManifest(m Manifest) Manifest {
+	cloned := m
+	cloned.Refs = cloneRefs(m.Refs)
+	cloned.Entries = append([]ManifestEntry(nil), m.Entries...)
+	if m.Checkpoint != nil {
+		checkpoint := *m.Checkpoint
+		cloned.Checkpoint = &checkpoint
+	}
+	if m.Prepared != nil {
+		cloned.Prepared = make(map[string]PreparedTransaction, len(m.Prepared))
+		for id, prepared := range m.Prepared {
+			prepared.Updates = append([]RefUpdate(nil), prepared.Updates...)
+			cloned.Prepared[id] = prepared
+		}
+	}
+	return cloned
+}
+
 func (s Store) Initialize(repoID, head, objectFormat string) error {
 	if err := validateID(repoID); err != nil {
 		return err

@@ -22,6 +22,19 @@ type Backend interface {
 	GarbageCollect(repoID string, olderThan time.Time) (GCResult, error)
 }
 
+// BatchCommitter publishes already-staged reference transactions in one
+// authoritative manifest update. The writer coordinator falls back to Commit
+// when a backend does not implement this optimization.
+type BatchCommitter interface {
+	CommitBatch(repoID string, batches [][]RefUpdate) ([]ManifestEntry, Manifest, error)
+}
+
+// ManifestReplayer applies entries from a manifest that a trusted coordinator
+// already loaded, avoiding redundant manifest reads on a catching-up replica.
+type ManifestReplayer interface {
+	ReplayManifest(repoID string, generation uint64, manifest Manifest, gitObjects string, apply func(ManifestEntry, EntryMeta) error) (Manifest, error)
+}
+
 func Open(location string) (Backend, error) {
 	if location == "" {
 		return nil, fmt.Errorf("storage location is required")

@@ -28,7 +28,8 @@ that child when it finishes:
   -nodes 2 \
   -pushes 100 \
   -blob-bytes 65536 \
-  -store s3://company-git/benchmarks
+  -store s3://company-git/benchmarks \
+  -persistent-writer
 ```
 
 Cleanup is deliberately refused unless the generated path contains a
@@ -45,12 +46,14 @@ and WAL-backed Git. It then:
 5. Confirms that all branch tips match the serving repository.
 
 With `-nodes 2` or greater, the benchmark instead creates disposable cache
-nodes over one authoritative store. Sequential pushes rotate across nodes and
-each result is immediately read through a different node. It then starts one
-simultaneous writer per node on disjoint refs, reconciles every cache, runs
-`git fsck --strict`, and verifies the final manifest generation and ref set.
-The report separates rotating push latency, cross-node read-after-write latency,
-and concurrent manifest-write latency.
+nodes over one authoritative store. By default, sequential pushes rotate
+across nodes. `-persistent-writer` starts a protected local coordinator, keeps
+pushes on one primary, caches staged metadata and manifest state, and batches
+concurrent manifest commits. Every result is immediately read through a
+different node. The benchmark reconciles every cache, runs `git fsck --strict`,
+and verifies the final manifest generation and ref set. Its report separates
+push latency, cross-node read-after-write latency, concurrent latency, and
+writer batch effectiveness.
 
 ## Repository lifecycle
 
@@ -123,24 +126,55 @@ export WALGIT_S3_ENDPOINT=https://nyc3.digitaloceanspaces.com
   -pushes 100 \
   -blob-bytes 65536 \
   -store s3://company-git/benchmarks \
-  -s3-single-writer
+  -s3-single-writer \
+  -persistent-writer
 ```
 
 `-s3-single-writer` disables conditional manifest replacement; it is unsafe if
-two processes can write the same repository concurrently. Immutable WAL
-objects, checksums, reconstruction, and cross-node reads remain enabled.
+two independent coordinators can write the same repository concurrently.
+`-persistent-writer` allows concurrent clients to safely share one coordinator
+and group commit. Immutable WAL objects, checksums, reconstruction, and
+cross-node reads remain enabled.
 
-On 2026-08-30, a two-node run against a `nyc3` Space from this development
-machine produced the following 100-push sample with 64 KiB changed per push:
+For a long-running repository, start the coordinator on the primary and expose
+its owner-only Unix socket to the Git gateway and hooks:
 
-| Operation | p50 | p90 | p99 | Worst |
+```sh
+export AWS_REGION=nyc3
+export WALGIT_S3_ENDPOINT=https://nyc3.digitaloceanspaces.com
+export WALGIT_S3_DISABLE_CONDITIONAL_WRITES=true
+export WALGIT_WRITER_SOCKET=/run/walgit/origin.sock
+
+walgit writer \
+  -socket "$WALGIT_WRITER_SOCKET" \
+  -store s3://company-git/walgit \
+  -id origin \
+  -batch-window 5ms \
+  -batch-maximum 64
+```
+
+The coordinator is repository-scoped. It retains one backend session, avoids
+redundant transaction and manifest reads, treats manifest publication as the
+durable commit point, and appends a compensating WAL entry if Git explicitly
+aborts afterward. Run only one coordinator for a Spaces-backed repository.
+
+The following two-node runs used 100 pushes with 64 KiB changed per push. The
+same-region runs executed on a temporary 2-vCPU machine in `nyc3` beside the
+Space:
+
+| Configuration | p50 | p90 | p99 | Worst |
 | --- | ---: | ---: | ---: | ---: |
-| Serialized push | 2.97 s | 3.41 s | 3.68 s | 5.57 s |
-| Cross-node read after write | 0.95 s | 1.07 s | 1.40 s | 1.50 s |
+| Push, Los Angeles to `nyc3`, direct hooks | 2.97 s | 3.41 s | 3.68 s | 5.57 s |
+| Push, same region, direct hooks | 509 ms | 655 ms | 764 ms | 766 ms |
+| Push, same region, persistent writer | **196 ms** | **245 ms** | **267 ms** | **279 ms** |
+| Cross-node read, same region, direct hooks | 170 ms | 206 ms | 258 ms | 328 ms |
+| Cross-node read, same region, persistent writer | **108 ms** | **146 ms** | **182 ms** | **188 ms** |
 
-All 101 updates reconstructed correctly and the isolated object prefix was
-empty after automatic cleanup. These measurements include WAN latency and are
-not a DigitalOcean service-wide benchmark.
+The persistent writer reduced same-region push p50 by 61% and p99 by 65%. An
+eight-client burst grouped eight simultaneous commits into four manifest
+writes, with a largest batch of four. Every run reconstructed all updates,
+passed `git fsck --strict`, and removed its isolated object prefix. These are
+development measurements, not a DigitalOcean service-wide benchmark.
 
 ## Smart HTTP
 
@@ -271,8 +305,11 @@ reconstructs refs and objects from the latest checkpoint plus WAL tail.
 - The manifest contains authoritative refs, symbolic `HEAD`, and object format.
 - Transactions are immutable and idempotent.
 - Expected old ref values are checked against the manifest, not only local Git.
-- Manifest-published updates remain marked as prepared and lock their touched
-  refs until Git reports `committed` or `aborted`.
+- Conditional-CAS updates remain marked as prepared and lock their touched refs
+  until Git reports `committed` or `aborted`.
+- A coordinated single writer uses manifest publication itself as the durable
+  commit point and keeps serialization state in memory, eliminating a second
+  foreground manifest update.
 - A normal abort appends an immutable inverse WAL transaction before releasing
   its locks, so a failed push cannot survive as an authoritative ref update.
 - Prepared transactions left by a process or network failure are presumed
@@ -293,8 +330,8 @@ reconstructs refs and objects from the latest checkpoint plus WAL tail.
 - Filesystem manifest publication uses an advisory lock plus atomic rename.
 - S3 manifest publication normally uses `If-Match` ETag CAS; immutable object
   creation uses `If-None-Match: *`. The explicit compatibility mode replaces
-  the manifest unconditionally and therefore requires external single-writer
-  serialization.
+  the manifest unconditionally and therefore requires the repository-scoped
+  writer coordinator or equivalent external serialization.
 
 Set `WALGIT_FAILPOINT` to a comma-separated selection of `stage.after_sync`,
 `commit.after_entry_rename`, `commit.after_manifest`,
@@ -310,10 +347,12 @@ This is still a prototype rather than a complete multi-tenant Git host.
 Authorization policies contain static token digests rather than an
 identity-provider integration. Nodes sharing a conditional-write-capable S3
 store converge on every request and preserve disjoint concurrent updates.
-DigitalOcean Spaces needs an external per-repository writer/coordinator because
-its object API cannot perform the required manifest CAS. There is no built-in
-service discovery, locality-aware load balancer, gossip, or cache warming. The
-system also has no LFS integration, admission-control quotas, or TLS
-termination. Scheduled maintenance is intentionally serialized with Git
-traffic per repository, so a large checkpoint can temporarily increase that
-repository's request latency.
+DigitalOcean Spaces uses the included per-repository writer coordinator because
+its object API cannot perform the required manifest CAS. The coordinator does
+not yet have distributed leases or automatic primary failover, so operators
+must ensure that only one instance is active for a Spaces-backed repository.
+There is no built-in service discovery, rendezvous-hash router, gossip, or
+cache warming. The system also has no LFS integration, admission-control
+quotas, or TLS termination. Scheduled maintenance is intentionally serialized
+with Git traffic per repository, so a large checkpoint can temporarily
+increase that repository's request latency.

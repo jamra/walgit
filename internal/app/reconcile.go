@@ -24,6 +24,14 @@ type localState struct {
 }
 
 func Reconcile(repo, storeRoot, id string) error {
+	return reconcile(repo, storeRoot, id, nil)
+}
+
+func reconcileWithManifest(repo, storeRoot, id string, manifest wal.Manifest) error {
+	return reconcile(repo, storeRoot, id, &manifest)
+}
+
+func reconcile(repo, storeRoot, id string, supplied *wal.Manifest) error {
 	repo, err := filepath.Abs(repo)
 	if err != nil {
 		return err
@@ -46,9 +54,14 @@ func Reconcile(repo, storeRoot, id string) error {
 	if err != nil {
 		return err
 	}
-	m, err := store.Load(id)
-	if err != nil {
-		return err
+	var m wal.Manifest
+	if supplied != nil {
+		m = *supplied
+	} else {
+		m, err = store.Load(id)
+		if err != nil {
+			return err
+		}
 	}
 	resolved := false
 	for _, prepared := range m.Prepared {
@@ -89,13 +102,22 @@ func Reconcile(repo, storeRoot, id string) error {
 		}
 		state.Generation = checkpoint.Generation
 	}
-	_, err = store.ReplayFrom(id, state.Generation, filepath.Join(repo, "objects"), func(entry wal.ManifestEntry, meta wal.EntryMeta) error {
+	apply := func(entry wal.ManifestEntry, meta wal.EntryMeta) error {
 		if err := applyUpdatesIdempotently(repo, meta.Updates); err != nil {
 			return err
 		}
 		state.Generation = entry.Generation
 		return nil
-	})
+	}
+	if supplied != nil {
+		if replayer, ok := store.(wal.ManifestReplayer); ok {
+			_, err = replayer.ReplayManifest(id, state.Generation, m, filepath.Join(repo, "objects"), apply)
+		} else {
+			_, err = store.ReplayFrom(id, state.Generation, filepath.Join(repo, "objects"), apply)
+		}
+	} else {
+		_, err = store.ReplayFrom(id, state.Generation, filepath.Join(repo, "objects"), apply)
+	}
 	if err != nil {
 		return err
 	}
@@ -273,6 +295,10 @@ func markCurrentIfManifestMatches(repo, storeRoot, id string) error {
 	if err != nil {
 		return err
 	}
+	return markCurrentFromManifest(repo, id, m)
+}
+
+func markCurrentFromManifest(repo, id string, m wal.Manifest) error {
 	if err := verifyRefs(repo, m.Refs); err != nil {
 		return nil // Another disjoint transaction may still be prepared.
 	}

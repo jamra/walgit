@@ -1,13 +1,18 @@
 package app
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"walgit/internal/wal"
 )
 
 func TestReadUpdates(t *testing.T) {
@@ -19,6 +24,101 @@ func TestReadUpdates(t *testing.T) {
 	}
 	if len(updates) != 1 || updates[0].New != newID || updates[0].Ref != "refs/heads/main" {
 		t.Fatalf("unexpected updates: %#v", updates)
+	}
+}
+
+func TestReadReferenceUpdatesIgnoresSymbolicHEADNotification(t *testing.T) {
+	old := strings.Repeat("0", 40)
+	newID := strings.Repeat("a", 40)
+	input := old + " " + newID + " HEAD\n" + old + " " + newID + " refs/heads/main\n"
+	updates, err := readReferenceUpdates(strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 1 || updates[0].Ref != "refs/heads/main" {
+		t.Fatalf("unexpected filtered updates: %#v", updates)
+	}
+	if _, err := readUpdates(strings.NewReader(old + " " + newID + " HEAD\n")); err == nil {
+		t.Fatal("pre-receive parser accepted a pseudo-ref")
+	}
+}
+
+func TestPersistentWriterGroupsConcurrentCommits(t *testing.T) {
+	root := t.TempDir()
+	storePath := filepath.Join(root, "store")
+	backend, err := wal.Open(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Initialize("repo", "refs/heads/main", "sha1"); err != nil {
+		t.Fatal(err)
+	}
+	socketRoot, err := os.MkdirTemp("/tmp", "walgit-writer-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(socketRoot)
+	socket := filepath.Join(socketRoot, "writer.sock")
+	handle, err := StartWriter(socket, storePath, "repo", 50*time.Millisecond, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("writer socket permissions are %o", info.Mode().Perm())
+	}
+
+	const count = 8
+	updates := make([][]wal.RefUpdate, count)
+	objects := filepath.Join(root, "objects")
+	if err := os.MkdirAll(objects, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := range updates {
+		updates[i] = []wal.RefUpdate{{
+			Old: strings.Repeat("0", 40), New: fmt.Sprintf("%040x", i+1), Ref: fmt.Sprintf("refs/heads/batch-%02d", i),
+		}}
+		if _, err := callWriter(socket, writerRequest{Operation: "stage", ObjectDir: objects, Updates: updates[i]}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := make(chan struct{})
+	errorsByWriter := make([]error, count)
+	var group sync.WaitGroup
+	for i := range updates {
+		group.Add(1)
+		go func(i int) {
+			defer group.Done()
+			<-start
+			_, errorsByWriter[i] = callWriter(socket, writerRequest{Operation: "commit", Updates: updates[i]})
+		}(i)
+	}
+	close(start)
+	group.Wait()
+	for i, err := range errorsByWriter {
+		if err != nil {
+			t.Fatalf("writer %d: %v", i, err)
+		}
+	}
+	response, err := callWriter(socket, writerRequest{Operation: "load"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Manifest.Generation != count || len(response.Manifest.Refs) != count {
+		t.Fatalf("unexpected grouped manifest: %#v", response.Manifest)
+	}
+	stats := handle.Stats()
+	if stats.CommitRequests != count || stats.CommitBatches >= count || stats.MaximumBatch < 2 {
+		t.Fatalf("commits were not grouped: %#v", stats)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(socket); !os.IsNotExist(err) {
+		t.Fatalf("writer socket survived shutdown: %v", err)
 	}
 }
 

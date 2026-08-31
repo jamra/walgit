@@ -178,6 +178,84 @@ func TestS3SingleWriterInitializationDoesNotReplaceExistingManifest(t *testing.T
 	}
 }
 
+func TestS3CoordinatedBatchUsesOneManifestWriteAndCachedMetadata(t *testing.T) {
+	client := newMemoryS3()
+	store := &S3Store{
+		client: client, bucket: "bucket", prefix: "walgit", timeout: time.Second,
+		unconditionalWrites: true, staged: make(map[string]stagedS3Transaction),
+	}
+	if err := store.Initialize("repo", "refs/heads/main", "sha1"); err != nil {
+		t.Fatal(err)
+	}
+	objects := t.TempDir()
+	zero := strings.Repeat("0", 40)
+	batches := [][]RefUpdate{
+		{{Old: zero, New: strings.Repeat("a", 40), Ref: "refs/heads/a"}},
+		{{Old: zero, New: strings.Repeat("b", 40), Ref: "refs/heads/b"}},
+	}
+	for _, updates := range batches {
+		if err := store.Stage("repo", objects, updates); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client.resetCalls()
+	entries, manifest, err := store.CommitBatch("repo", batches)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || manifest.Generation != 2 || len(manifest.Prepared) != 0 {
+		t.Fatalf("unexpected coordinated batch: %#v %#v", entries, manifest)
+	}
+	if put, get, head := client.calls(); put != 1 || get != 1 || head != 0 {
+		t.Fatalf("cold batch calls: put=%d get=%d head=%d", put, get, head)
+	}
+
+	third := []RefUpdate{{Old: zero, New: strings.Repeat("c", 40), Ref: "refs/heads/c"}}
+	if err := store.Stage("repo", objects, third); err != nil {
+		t.Fatal(err)
+	}
+	client.resetCalls()
+	if _, _, err := store.Commit("repo", third); err != nil {
+		t.Fatal(err)
+	}
+	if put, get, head := client.calls(); put != 1 || get != 0 || head != 0 {
+		t.Fatalf("warm commit calls: put=%d get=%d head=%d", put, get, head)
+	}
+	client.resetCalls()
+	if err := store.Finalize("repo", third); err != nil {
+		t.Fatal(err)
+	}
+	if put, get, head := client.calls(); put != 0 || get != 0 || head != 0 {
+		t.Fatalf("coordinated finalize performed I/O: put=%d get=%d head=%d", put, get, head)
+	}
+	if err := store.Abort("repo", third); err != nil {
+		t.Fatal(err)
+	}
+	rolledBack, err := store.Load("repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rolledBack.Generation != 4 || rolledBack.Refs["refs/heads/c"] != "" {
+		t.Fatalf("coordinated abort did not append compensation: %#v", rolledBack)
+	}
+	if err := store.Stage("repo", objects, third); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Commit("repo", third); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Abort("repo", third); err != nil {
+		t.Fatal(err)
+	}
+	repeated, err := store.Load("repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeated.Generation != 6 || repeated.Refs["refs/heads/c"] != "" {
+		t.Fatalf("repeated coordinated abort did not compensate again: %#v", repeated)
+	}
+}
+
 func TestS3ConcurrentCommitsUseManifestCAS(t *testing.T) {
 	store := &S3Store{client: newMemoryS3(), bucket: "bucket", prefix: "walgit", timeout: time.Second}
 	if err := store.Initialize("repo", "refs/heads/main", "sha1"); err != nil {
@@ -220,8 +298,11 @@ func TestS3ConcurrentCommitsUseManifestCAS(t *testing.T) {
 }
 
 type memoryS3 struct {
-	mu      sync.Mutex
-	objects map[string]memoryS3Object
+	mu        sync.Mutex
+	objects   map[string]memoryS3Object
+	putCalls  int
+	getCalls  int
+	headCalls int
 }
 
 type memoryS3Object struct {
@@ -241,6 +322,7 @@ func (m *memoryS3) PutObject(_ context.Context, input *s3.PutObjectInput, _ ...f
 	key := aws.ToString(input.Key)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.putCalls++
 	current, exists := m.objects[key]
 	if aws.ToString(input.IfNoneMatch) == "*" && exists {
 		return nil, testAPIError{code: "PreconditionFailed"}
@@ -261,6 +343,7 @@ func (m *memoryS3) PutObject(_ context.Context, input *s3.PutObjectInput, _ ...f
 func (m *memoryS3) GetObject(_ context.Context, input *s3.GetObjectInput, _ ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.getCalls++
 	object, ok := m.objects[aws.ToString(input.Key)]
 	if !ok {
 		return nil, testAPIError{code: "NoSuchKey"}
@@ -271,6 +354,7 @@ func (m *memoryS3) GetObject(_ context.Context, input *s3.GetObjectInput, _ ...f
 func (m *memoryS3) HeadObject(_ context.Context, input *s3.HeadObjectInput, _ ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.headCalls++
 	object, ok := m.objects[aws.ToString(input.Key)]
 	if !ok {
 		return nil, testAPIError{code: "NotFound"}
@@ -280,6 +364,18 @@ func (m *memoryS3) HeadObject(_ context.Context, input *s3.HeadObjectInput, _ ..
 		metadata[key] = value
 	}
 	return &s3.HeadObjectOutput{ContentLength: aws.Int64(int64(len(object.data))), ETag: aws.String(object.etag), Metadata: metadata}, nil
+}
+
+func (m *memoryS3) resetCalls() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.putCalls, m.getCalls, m.headCalls = 0, 0, 0
+}
+
+func (m *memoryS3) calls() (put, get, head int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.putCalls, m.getCalls, m.headCalls
 }
 
 func (m *memoryS3) DeleteObject(_ context.Context, input *s3.DeleteObjectInput, _ ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {

@@ -111,6 +111,10 @@ func PreReceive(input io.Reader) error {
 	if len(updates) == 0 {
 		return nil
 	}
+	if socket := os.Getenv(writerSocketEnvironment); socket != "" {
+		_, err := callWriter(socket, writerRequest{Operation: "stage", ObjectDir: objects, Updates: updates})
+		return err
+	}
 	backend, err := wal.Open(store)
 	if err != nil {
 		return err
@@ -124,9 +128,12 @@ func ReferenceTransaction(state string, input io.Reader) error {
 	if store == "" || id == "" {
 		return errors.New("hook environment is incomplete")
 	}
-	updates, err := readUpdates(input)
+	updates, err := readReferenceUpdates(input)
 	if err != nil {
 		return err
+	}
+	if socket := os.Getenv(writerSocketEnvironment); socket != "" {
+		return referenceTransactionWithWriter(socket, state, updates)
 	}
 	switch state {
 	case "prepared":
@@ -161,6 +168,33 @@ func ReferenceTransaction(state string, input io.Reader) error {
 	default:
 		return fmt.Errorf("unknown reference transaction state %q", state)
 	}
+}
+
+func referenceTransactionWithWriter(socket, state string, updates []wal.RefUpdate) error {
+	operation := state
+	if state == "prepared" {
+		operation = "commit"
+	} else if state == "aborted" {
+		operation = "abort"
+	} else if state == "committed" {
+		operation = "finalize"
+	}
+	if operation != "commit" && operation != "abort" && operation != "finalize" {
+		return fmt.Errorf("unknown reference transaction state %q", state)
+	}
+	response, err := callWriter(socket, writerRequest{Operation: operation, Updates: updates})
+	if err != nil {
+		return err
+	}
+	if state != "committed" {
+		return nil
+	}
+	repo := os.Getenv("WALGIT_REPO")
+	id := os.Getenv("WALGIT_REPO_ID")
+	if repo == "" || id == "" {
+		return errors.New("hook repository path is missing")
+	}
+	return markCurrentFromManifest(repo, id, response.Manifest)
 }
 
 func Restore(repo, store, id string) error {
@@ -206,7 +240,7 @@ func Gateway(repo, store, id, service string, stdin io.Reader, stdout, stderr io
 	if service != "upload-pack" && service != "receive-pack" {
 		return fmt.Errorf("unsupported Git service %q", service)
 	}
-	if err := Reconcile(repo, store, id); err != nil {
+	if err := reconcileForGateway(repo, store, id); err != nil {
 		return err
 	}
 	cmd := exec.Command("git-"+service, repo)
@@ -215,6 +249,24 @@ func Gateway(repo, store, id, service string, stdin io.Reader, stdout, stderr io
 		return fmt.Errorf("git-%s: %w", service, err)
 	}
 	return nil
+}
+
+func reconcileForGateway(repo, store, id string) error {
+	if socket := os.Getenv(writerSocketEnvironment); socket != "" {
+		response, err := callWriter(socket, writerRequest{Operation: "load"})
+		if err != nil {
+			return err
+		}
+		state, err := readLocalState(repo, id)
+		if err != nil {
+			return err
+		}
+		if state.Generation == response.Manifest.Generation {
+			return nil
+		}
+		return reconcileWithManifest(repo, store, id, response.Manifest)
+	}
+	return Reconcile(repo, store, id)
 }
 
 type benchmarkResult struct {
@@ -414,12 +466,26 @@ func sumDurations(samples []time.Duration) time.Duration {
 }
 
 func readUpdates(r io.Reader) ([]wal.RefUpdate, error) {
+	return readUpdatesAllowingHEAD(r, false)
+}
+
+func readReferenceUpdates(r io.Reader) ([]wal.RefUpdate, error) {
+	return readUpdatesAllowingHEAD(r, true)
+}
+
+func readUpdatesAllowingHEAD(r io.Reader, allowHEAD bool) ([]wal.RefUpdate, error) {
 	var updates []wal.RefUpdate
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		parts := strings.Fields(scanner.Text())
 		validOIDLength := len(parts) == 3 && (len(parts[0]) == 40 || len(parts[0]) == 64) && len(parts[1]) == len(parts[0])
-		if !validOIDLength || !strings.HasPrefix(parts[2], "refs/") {
+		if !validOIDLength {
+			return nil, fmt.Errorf("invalid reference-transaction input %q", scanner.Text())
+		}
+		if allowHEAD && parts[2] == "HEAD" {
+			continue
+		}
+		if !strings.HasPrefix(parts[2], "refs/") {
 			return nil, fmt.Errorf("invalid reference-transaction input %q", scanner.Text())
 		}
 		updates = append(updates, wal.RefUpdate{Old: parts[0], New: parts[1], Ref: parts[2]})

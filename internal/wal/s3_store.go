@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -36,6 +37,15 @@ type S3Store struct {
 	prefix              string
 	timeout             time.Duration
 	unconditionalWrites bool
+	stateMu             sync.Mutex
+	staged              map[string]stagedS3Transaction
+	cachedManifest      *Manifest
+	cachedETag          string
+}
+
+type stagedS3Transaction struct {
+	digest string
+	bytes  int64
 }
 
 func OpenS3(location string) (Backend, error) {
@@ -68,7 +78,7 @@ func OpenS3(location string) (Backend, error) {
 	unconditional, _ := strconv.ParseBool(os.Getenv("WALGIT_S3_DISABLE_CONDITIONAL_WRITES"))
 	return &S3Store{
 		client: client, bucket: bucket, prefix: strings.Trim(prefix, "/"), timeout: 2 * time.Minute,
-		unconditionalWrites: unconditional,
+		unconditionalWrites: unconditional, staged: make(map[string]stagedS3Transaction),
 	}, nil
 }
 
@@ -168,76 +178,149 @@ func (s *S3Store) Stage(repoID, objectDir string, updates []RefUpdate) error {
 		Body: f, ContentLength: aws.Int64(size), IfNoneMatch: aws.String("*"),
 		Metadata: map[string]string{"walgit-sha256": digest}, ContentType: aws.String("application/octet-stream"),
 	})
-	if isPrecondition(err) {
-		return nil // Identical ref transaction already staged by a retry or racing writer.
+	if err == nil || isPrecondition(err) {
+		s.stateMu.Lock()
+		if s.staged == nil {
+			s.staged = make(map[string]stagedS3Transaction)
+		}
+		s.staged[repoID+"/"+txID] = stagedS3Transaction{digest: digest, bytes: size}
+		s.stateMu.Unlock()
+		return nil // An immutable retry is the same staged transaction.
 	}
 	return err
 }
 
 func (s *S3Store) Commit(repoID string, updates []RefUpdate) (ManifestEntry, Manifest, error) {
-	txID, err := transactionID(updates)
+	entries, manifest, err := s.CommitBatch(repoID, [][]RefUpdate{updates})
 	if err != nil {
 		return ManifestEntry{}, Manifest{}, err
 	}
-	transactionFile := "transactions/" + txID + ".wal"
-	head, err := s.head(repoID, transactionFile)
-	if err != nil {
-		return ManifestEntry{}, Manifest{}, fmt.Errorf("read staged transaction: %w", err)
+	return entries[0], manifest, nil
+}
+
+func (s *S3Store) CommitBatch(repoID string, batches [][]RefUpdate) ([]ManifestEntry, Manifest, error) {
+	if len(batches) == 0 {
+		return nil, Manifest{}, errors.New("commit batch is empty")
 	}
-	digest := head.Metadata["walgit-sha256"]
-	if digest == "" {
-		return ManifestEntry{}, Manifest{}, errors.New("staged transaction is missing its SHA-256 metadata")
+	type stagedBatch struct {
+		updates []RefUpdate
+		txID    string
+		file    string
+		object  stagedS3Transaction
 	}
-	for attempt := 0; attempt < 32; attempt++ {
-		m, etag, err := s.loadWithETag(repoID)
+	staged := make([]stagedBatch, len(batches))
+	for i, updates := range batches {
+		txID, err := transactionID(updates)
 		if err != nil {
-			return ManifestEntry{}, Manifest{}, err
+			return nil, Manifest{}, err
 		}
-		if updatesAlreadyApplied(m, updates) {
-			entry := ManifestEntry{Generation: m.Generation, TransactionID: txID}
-			for i := len(m.Entries) - 1; i >= 0; i-- {
-				if m.Entries[i].TransactionID == txID {
-					entry = m.Entries[i]
-					break
+		staged[i] = stagedBatch{updates: updates, txID: txID, file: "transactions/" + txID + ".wal"}
+	}
+
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	for i := range staged {
+		if object, ok := s.staged[repoID+"/"+staged[i].txID]; ok {
+			staged[i].object = object
+			continue
+		}
+		head, err := s.head(repoID, staged[i].file)
+		if err != nil {
+			return nil, Manifest{}, fmt.Errorf("read staged transaction: %w", err)
+		}
+		staged[i].object = stagedS3Transaction{
+			digest: head.Metadata["walgit-sha256"], bytes: aws.ToInt64(head.ContentLength),
+		}
+		if staged[i].object.digest == "" {
+			return nil, Manifest{}, errors.New("staged transaction is missing its SHA-256 metadata")
+		}
+	}
+
+	for attempt := 0; attempt < 32; attempt++ {
+		var m Manifest
+		var etag string
+		var err error
+		if s.unconditionalWrites && s.cachedManifest != nil {
+			m, etag = cloneManifest(*s.cachedManifest), s.cachedETag
+		} else {
+			m, etag, err = s.loadWithETag(repoID)
+			if err != nil {
+				return nil, Manifest{}, err
+			}
+		}
+		entries := make([]ManifestEntry, len(staged))
+		changed := false
+		for batchIndex, batch := range staged {
+			if updatesAlreadyApplied(m, batch.updates) {
+				entry := ManifestEntry{Generation: m.Generation, TransactionID: batch.txID}
+				for i := len(m.Entries) - 1; i >= 0; i-- {
+					if m.Entries[i].TransactionID == batch.txID {
+						entry = m.Entries[i]
+						break
+					}
+				}
+				entries[batchIndex] = entry
+				continue
+			}
+			if err := validatePreparedLocks(m, batch.txID, batch.updates); err != nil {
+				return nil, Manifest{}, err
+			}
+			if err := validateUpdates(m, batch.updates); err != nil {
+				return nil, Manifest{}, err
+			}
+			generation := m.Generation + 1
+			entry := ManifestEntry{
+				Generation: generation, TransactionID: batch.txID, File: batch.file,
+				SHA256: batch.object.digest, Bytes: batch.object.bytes,
+			}
+			for _, update := range batch.updates {
+				if isZeroOID(update.New) {
+					delete(m.Refs, update.Ref)
+				} else {
+					m.Refs[update.Ref] = update.New
 				}
 			}
-			return entry, m, nil
-		}
-		if err := validatePreparedLocks(m, txID, updates); err != nil {
-			return ManifestEntry{}, Manifest{}, err
-		}
-		if err := validateUpdates(m, updates); err != nil {
-			return ManifestEntry{}, Manifest{}, err
-		}
-		generation := m.Generation + 1
-		entry := ManifestEntry{
-			Generation: generation, TransactionID: txID, File: transactionFile,
-			SHA256: digest, Bytes: aws.ToInt64(head.ContentLength),
-		}
-		for _, update := range updates {
-			if isZeroOID(update.New) {
-				delete(m.Refs, update.Ref)
-			} else {
-				m.Refs[update.Ref] = update.New
+			m.Generation = generation
+			m.Entries = append(m.Entries, entry)
+			if !s.unconditionalWrites {
+				if m.Prepared == nil {
+					m.Prepared = make(map[string]PreparedTransaction)
+				}
+				m.Prepared[batch.txID] = PreparedTransaction{
+					TransactionID: batch.txID, Generation: generation, CreatedAt: time.Now().UTC(), Updates: batch.updates,
+				}
 			}
+			entries[batchIndex] = entry
+			changed = true
 		}
-		m.Generation = generation
-		m.Entries = append(m.Entries, entry)
-		if m.Prepared == nil {
-			m.Prepared = make(map[string]PreparedTransaction)
+		if !changed {
+			if s.unconditionalWrites {
+				cached := cloneManifest(m)
+				s.cachedManifest = &cached
+				s.cachedETag = etag
+			}
+			return entries, cloneManifest(m), nil
 		}
-		m.Prepared[txID] = PreparedTransaction{TransactionID: txID, Generation: generation, CreatedAt: time.Now().UTC(), Updates: updates}
 		if err := s.putManifest(repoID, m, etag, false); isPrecondition(err) || isConflict(err) {
+			s.cachedManifest = nil
 			continue
 		} else if err != nil {
-			return ManifestEntry{}, Manifest{}, err
+			return nil, Manifest{}, err
 		}
-		return entry, m, nil
+		if s.unconditionalWrites {
+			cached := cloneManifest(m)
+			s.cachedManifest = &cached
+			s.cachedETag = etag
+		}
+		return entries, cloneManifest(m), nil
 	}
-	return ManifestEntry{}, Manifest{}, errors.New("S3 manifest remained contended after 32 CAS attempts")
+	return nil, Manifest{}, errors.New("S3 manifest remained contended after 32 CAS attempts")
 }
 
 func (s *S3Store) Finalize(repoID string, updates []RefUpdate) error {
+	if s.unconditionalWrites {
+		return nil // Coordinated manifest publication is the durable commit point.
+	}
 	txID, err := transactionID(updates)
 	if err != nil {
 		return err
@@ -265,6 +348,9 @@ func (s *S3Store) Finalize(repoID string, updates []RefUpdate) error {
 }
 
 func (s *S3Store) Abort(repoID string, updates []RefUpdate) error {
+	if s.unconditionalWrites {
+		return s.abortCoordinated(repoID, updates)
+	}
 	txID, err := transactionID(updates)
 	if err != nil {
 		return err
@@ -329,6 +415,76 @@ func (s *S3Store) Abort(repoID string, updates []RefUpdate) error {
 	return errors.New("S3 manifest remained contended while rolling back transaction")
 }
 
+func (s *S3Store) abortCoordinated(repoID string, updates []RefUpdate) error {
+	txID, err := transactionID(updates)
+	if err != nil {
+		return err
+	}
+	rollbackID := "rollback-" + txID
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+
+	var m Manifest
+	var etag string
+	if s.cachedManifest != nil {
+		m, etag = cloneManifest(*s.cachedManifest), s.cachedETag
+	} else {
+		m, etag, err = s.loadWithETag(repoID)
+		if err != nil {
+			return err
+		}
+	}
+	originalFound := false
+	for _, entry := range m.Entries {
+		if entry.TransactionID == txID {
+			originalFound = true
+		}
+	}
+	if !originalFound {
+		return nil
+	}
+	before, after := transactionState(m, updates)
+	if before {
+		return nil
+	}
+	if !after {
+		return fmt.Errorf("cannot roll back transaction %s because a touched ref advanced", txID)
+	}
+	inverse := invertUpdates(updates)
+	transactionFile := "transactions/" + rollbackID + ".wal"
+	head, err := s.putMetadataTransaction(repoID, transactionFile, EntryMeta{
+		TransactionID: rollbackID, CreatedAt: time.Now().UTC(), Updates: inverse,
+	})
+	if err != nil {
+		return err
+	}
+	digest := head.Metadata["walgit-sha256"]
+	if digest == "" {
+		return errors.New("rollback transaction is missing its SHA-256 metadata")
+	}
+	generation := m.Generation + 1
+	for _, update := range inverse {
+		if isZeroOID(update.New) {
+			delete(m.Refs, update.Ref)
+		} else {
+			m.Refs[update.Ref] = update.New
+		}
+	}
+	m.Generation = generation
+	m.Entries = append(m.Entries, ManifestEntry{
+		Generation: generation, TransactionID: rollbackID, File: transactionFile,
+		SHA256: digest, Bytes: aws.ToInt64(head.ContentLength),
+	})
+	delete(m.Prepared, txID)
+	if err := s.putManifest(repoID, m, etag, false); err != nil {
+		return err
+	}
+	cached := cloneManifest(m)
+	s.cachedManifest = &cached
+	s.cachedETag = etag
+	return nil
+}
+
 func (s *S3Store) putMetadataTransaction(repoID, transactionFile string, meta EntryMeta) (*s3.HeadObjectOutput, error) {
 	tmp, err := os.CreateTemp("", "walgit-s3-metadata-*.wal")
 	if err != nil {
@@ -373,6 +529,21 @@ func (s *S3Store) putMetadataTransaction(repoID, transactionFile string, meta En
 }
 
 func (s *S3Store) Load(repoID string) (Manifest, error) {
+	if s.unconditionalWrites {
+		s.stateMu.Lock()
+		defer s.stateMu.Unlock()
+		if s.cachedManifest != nil {
+			return cloneManifest(*s.cachedManifest), nil
+		}
+		m, etag, err := s.loadWithETag(repoID)
+		if err != nil {
+			return Manifest{}, err
+		}
+		cached := cloneManifest(m)
+		s.cachedManifest = &cached
+		s.cachedETag = etag
+		return cloneManifest(m), nil
+	}
 	m, _, err := s.loadWithETag(repoID)
 	return m, err
 }
@@ -382,6 +553,10 @@ func (s *S3Store) ReplayFrom(repoID string, generation uint64, gitObjects string
 	if err != nil {
 		return Manifest{}, err
 	}
+	return s.ReplayManifest(repoID, generation, m, gitObjects, apply)
+}
+
+func (s *S3Store) ReplayManifest(repoID string, generation uint64, m Manifest, gitObjects string, apply func(ManifestEntry, EntryMeta) error) (Manifest, error) {
 	if generation > m.Generation {
 		return Manifest{}, fmt.Errorf("local generation %d is ahead of manifest generation %d", generation, m.Generation)
 	}

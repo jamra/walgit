@@ -109,6 +109,15 @@ func main() {
 				CompactAfterBytes: *compactBytes, GCGrace: *gcGrace, IdleCacheAfter: *idleCacheAfter,
 			})
 		}
+	case "writer":
+		fs := flag.NewFlagSet("writer", flag.ExitOnError)
+		socket := fs.String("socket", "", "absolute Unix socket path")
+		store := fs.String("store", "", "durable storage path or s3:// URI")
+		id := fs.String("id", "", "repository ID")
+		batchWindow := fs.Duration("batch-window", 5*time.Millisecond, "maximum group-commit collection window")
+		batchMaximum := fs.Int("batch-maximum", 64, "maximum transactions per manifest commit")
+		_ = fs.Parse(os.Args[2:])
+		err = app.ServeWriter(*socket, *store, *id, *batchWindow, *batchMaximum)
 	case "bench":
 		fs := flag.NewFlagSet("bench", flag.ExitOnError)
 		pushes := fs.Int("pushes", 100, "number of pushes")
@@ -116,11 +125,15 @@ func main() {
 		nodes := fs.Int("nodes", 1, "serving cache nodes; values above 1 run the shared-store benchmark")
 		benchmarkStore := fs.String("store", "", "base s3:// URI for an isolated live-store benchmark")
 		s3SingleWriter := fs.Bool("s3-single-writer", false, "disable manifest CAS for a store with externally serialized writes")
+		persistentWriter := fs.Bool("persistent-writer", false, "route pushes through a persistent group-commit coordinator")
 		keep := fs.Bool("keep", false, "keep benchmark files")
 		_ = fs.Parse(os.Args[2:])
 		if *nodes > 1 {
 			if *s3SingleWriter {
 				_ = os.Setenv("WALGIT_S3_DISABLE_CONDITIONAL_WRITES", "true")
+			}
+			if *persistentWriter {
+				_ = os.Setenv("WALGIT_BENCH_PERSISTENT_WRITER", "true")
 			}
 			err = app.BenchmarkNodesAtStore(*nodes, *pushes, *bytes, *benchmarkStore, *keep, os.Stdout)
 		} else {
@@ -137,5 +150,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: walgit <init|hook|restore|reconcile|gateway|compact|gc|serve|bench> [options]")
+	fmt.Fprintln(os.Stderr, "usage: walgit <init|hook|restore|reconcile|gateway|compact|gc|serve|writer|bench> [options]")
 }

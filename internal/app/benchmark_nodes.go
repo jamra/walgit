@@ -35,6 +35,7 @@ type multiNodeBenchmarkResult struct {
 	ConsistencyMode            string                    `json:"consistency_mode"`
 	StoreLocation              string                    `json:"store_location,omitempty"`
 	CleanupComplete            bool                      `json:"cleanup_complete"`
+	Writer                     *WriterStats              `json:"writer,omitempty"`
 	BenchmarkFilesDirectory    string                    `json:"benchmark_files_dir,omitempty"`
 }
 
@@ -86,9 +87,31 @@ func BenchmarkNodesAtStore(nodes, pushes, blobBytes int, storeBase string, keep 
 		}()
 	}
 	concurrentWriterCount := nodes
+	var writerHandle *WriterHandle
 	if disabled, _ := strconv.ParseBool(os.Getenv("WALGIT_S3_DISABLE_CONDITIONAL_WRITES")); storage == "s3" && disabled {
 		concurrentWriterCount = 1
 		consistencyMode = "externally-serialized-single-writer"
+	}
+	if enabled, _ := strconv.ParseBool(os.Getenv("WALGIT_BENCH_PERSISTENT_WRITER")); enabled {
+		socket := filepath.Join(root, "writer.sock")
+		writerHandle, err = StartWriter(socket, store, "multinode", 5*time.Millisecond, 64)
+		if err != nil {
+			return err
+		}
+		defer writerHandle.Close() //nolint:errcheck
+		previousSocket, hadSocket := os.LookupEnv(writerSocketEnvironment)
+		if err := os.Setenv(writerSocketEnvironment, socket); err != nil {
+			return err
+		}
+		defer func() {
+			if hadSocket {
+				_ = os.Setenv(writerSocketEnvironment, previousSocket)
+			} else {
+				_ = os.Unsetenv(writerSocketEnvironment)
+			}
+		}()
+		concurrentWriterCount = nodes
+		consistencyMode = "coordinated-single-writer"
 	}
 	nodePaths := make([]string, nodes)
 	for i := range nodePaths {
@@ -132,6 +155,9 @@ func BenchmarkNodesAtStore(nodes, pushes, blobBytes int, storeBase string, keep 
 			}
 		}
 		writer := i % nodes
+		if writerHandle != nil {
+			writer = 0
+		}
 		started := time.Now()
 		if err := run("", "git", "-C", work, "push", "-q", "--receive-pack="+receiveGateway, nodePaths[writer], "HEAD:refs/heads/main"); err != nil {
 			return fmt.Errorf("node %d push %d: %w", writer, i+1, err)
@@ -192,7 +218,11 @@ func BenchmarkNodesAtStore(nodes, pushes, blobBytes int, storeBase string, keep 
 			<-start
 			started := time.Now()
 			branch := fmt.Sprintf("HEAD:refs/heads/concurrent/%02d", i)
-			concurrentErrors[i] = run("", "git", "-C", writers[i], "push", "-q", "--receive-pack="+receiveGateway, nodePaths[i], branch)
+			targetNode := i
+			if writerHandle != nil {
+				targetNode = 0
+			}
+			concurrentErrors[i] = run("", "git", "-C", writers[i], "push", "-q", "--receive-pack="+receiveGateway, nodePaths[targetNode], branch)
 			concurrentSamples[i] = time.Since(started)
 		}(i)
 	}
@@ -247,6 +277,10 @@ func BenchmarkNodesAtStore(nodes, pushes, blobBytes int, storeBase string, keep 
 		ConcurrentWriteBatchMillis: float64(batchElapsed.Microseconds()) / 1000,
 		FinalGeneration:            manifest.Generation, FinalReferenceCount: len(manifest.Refs), WALBytes: walBytes, FinalHead: finalHead,
 		Storage: storage, ConsistencyMode: consistencyMode, CleanupComplete: cleanupComplete,
+	}
+	if writerHandle != nil {
+		stats := writerHandle.Stats()
+		result.Writer = &stats
 	}
 	if storage == "s3" {
 		result.StoreLocation = store
