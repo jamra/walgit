@@ -1,0 +1,770 @@
+package wal
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
+	awshttp "github.com/aws/smithy-go/transport/http"
+)
+
+type s3Client interface {
+	PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
+	HeadObject(context.Context, *s3.HeadObjectInput, ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
+	DeleteObject(context.Context, *s3.DeleteObjectInput, ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
+	ListObjectsV2(context.Context, *s3.ListObjectsV2Input, ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+}
+
+type S3Store struct {
+	client              s3Client
+	bucket              string
+	prefix              string
+	timeout             time.Duration
+	unconditionalWrites bool
+}
+
+func OpenS3(location string) (Backend, error) {
+	withoutScheme := strings.TrimPrefix(location, "s3://")
+	bucket, prefix, _ := strings.Cut(withoutScheme, "/")
+	if bucket == "" {
+		return nil, fmt.Errorf("S3 storage URI requires a bucket")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	options := []func(*config.LoadOptions) error{}
+	if region := os.Getenv("AWS_REGION"); region != "" {
+		options = append(options, config.WithRegion(region))
+	}
+	cfg, err := config.LoadDefaultConfig(ctx, options...)
+	if err != nil {
+		return nil, fmt.Errorf("load AWS configuration: %w", err)
+	}
+	if os.Getenv("WALGIT_S3_ENDPOINT") != "" {
+		cfg.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
+	}
+	client := s3.NewFromConfig(cfg, func(options *s3.Options) {
+		if endpoint := os.Getenv("WALGIT_S3_ENDPOINT"); endpoint != "" {
+			options.BaseEndpoint = aws.String(endpoint)
+		}
+		if value, _ := strconv.ParseBool(os.Getenv("WALGIT_S3_PATH_STYLE")); value {
+			options.UsePathStyle = true
+		}
+	})
+	unconditional, _ := strconv.ParseBool(os.Getenv("WALGIT_S3_DISABLE_CONDITIONAL_WRITES"))
+	return &S3Store{
+		client: client, bucket: bucket, prefix: strings.Trim(prefix, "/"), timeout: 2 * time.Minute,
+		unconditionalWrites: unconditional,
+	}, nil
+}
+
+func (s *S3Store) Initialize(repoID, head, objectFormat string) error {
+	if err := validateID(repoID); err != nil {
+		return err
+	}
+	if head == "" {
+		head = "refs/heads/main"
+	}
+	if objectFormat != "sha1" && objectFormat != "sha256" {
+		return fmt.Errorf("unsupported object format %q", objectFormat)
+	}
+	m := Manifest{Version: manifestVersion, Head: head, ObjectFormat: objectFormat, Refs: map[string]string{}}
+	if s.unconditionalWrites {
+		existing, err := s.Load(repoID)
+		if err == nil {
+			if existing.ObjectFormat != objectFormat || existing.Head != head {
+				return fmt.Errorf("existing S3 manifest configuration does not match repository")
+			}
+			return nil
+		}
+		if !isNotFound(err) {
+			return err
+		}
+	}
+	data, err := marshalManifest(m)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := s.context()
+	defer cancel()
+	input := &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(s.key(repoID, "manifest.json")),
+		Body: strings.NewReader(string(data)), ContentLength: aws.Int64(int64(len(data))),
+		ContentType: aws.String("application/json"),
+	}
+	if !s.unconditionalWrites {
+		input.IfNoneMatch = aws.String("*")
+	}
+	_, err = s.client.PutObject(ctx, input)
+	if s.unconditionalWrites {
+		return err
+	}
+	if isPrecondition(err) {
+		existing, loadErr := s.Load(repoID)
+		if loadErr != nil {
+			return loadErr
+		}
+		if existing.ObjectFormat != objectFormat || existing.Head != head {
+			return fmt.Errorf("existing S3 manifest configuration does not match repository")
+		}
+		return nil
+	}
+	return err
+}
+
+func (s *S3Store) Stage(repoID, objectDir string, updates []RefUpdate) error {
+	if err := validateID(repoID); err != nil {
+		return err
+	}
+	txID, err := transactionID(updates)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp("", "walgit-s3-stage-*.wal")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	meta := EntryMeta{TransactionID: txID, CreatedAt: time.Now().UTC(), Updates: updates}
+	if err := writeArchive(tmp, meta, objectDir); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	digest, size, err := fileDigest(name)
+	if err != nil {
+		return err
+	}
+	f, err := os.Open(name)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	ctx, cancel := s.context()
+	defer cancel()
+	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(s.key(repoID, "transactions/"+txID+".wal")),
+		Body: f, ContentLength: aws.Int64(size), IfNoneMatch: aws.String("*"),
+		Metadata: map[string]string{"walgit-sha256": digest}, ContentType: aws.String("application/octet-stream"),
+	})
+	if isPrecondition(err) {
+		return nil // Identical ref transaction already staged by a retry or racing writer.
+	}
+	return err
+}
+
+func (s *S3Store) Commit(repoID string, updates []RefUpdate) (ManifestEntry, Manifest, error) {
+	txID, err := transactionID(updates)
+	if err != nil {
+		return ManifestEntry{}, Manifest{}, err
+	}
+	transactionFile := "transactions/" + txID + ".wal"
+	head, err := s.head(repoID, transactionFile)
+	if err != nil {
+		return ManifestEntry{}, Manifest{}, fmt.Errorf("read staged transaction: %w", err)
+	}
+	digest := head.Metadata["walgit-sha256"]
+	if digest == "" {
+		return ManifestEntry{}, Manifest{}, errors.New("staged transaction is missing its SHA-256 metadata")
+	}
+	for attempt := 0; attempt < 32; attempt++ {
+		m, etag, err := s.loadWithETag(repoID)
+		if err != nil {
+			return ManifestEntry{}, Manifest{}, err
+		}
+		if updatesAlreadyApplied(m, updates) {
+			entry := ManifestEntry{Generation: m.Generation, TransactionID: txID}
+			for i := len(m.Entries) - 1; i >= 0; i-- {
+				if m.Entries[i].TransactionID == txID {
+					entry = m.Entries[i]
+					break
+				}
+			}
+			return entry, m, nil
+		}
+		if err := validatePreparedLocks(m, txID, updates); err != nil {
+			return ManifestEntry{}, Manifest{}, err
+		}
+		if err := validateUpdates(m, updates); err != nil {
+			return ManifestEntry{}, Manifest{}, err
+		}
+		generation := m.Generation + 1
+		entry := ManifestEntry{
+			Generation: generation, TransactionID: txID, File: transactionFile,
+			SHA256: digest, Bytes: aws.ToInt64(head.ContentLength),
+		}
+		for _, update := range updates {
+			if isZeroOID(update.New) {
+				delete(m.Refs, update.Ref)
+			} else {
+				m.Refs[update.Ref] = update.New
+			}
+		}
+		m.Generation = generation
+		m.Entries = append(m.Entries, entry)
+		if m.Prepared == nil {
+			m.Prepared = make(map[string]PreparedTransaction)
+		}
+		m.Prepared[txID] = PreparedTransaction{TransactionID: txID, Generation: generation, CreatedAt: time.Now().UTC(), Updates: updates}
+		if err := s.putManifest(repoID, m, etag, false); isPrecondition(err) || isConflict(err) {
+			continue
+		} else if err != nil {
+			return ManifestEntry{}, Manifest{}, err
+		}
+		return entry, m, nil
+	}
+	return ManifestEntry{}, Manifest{}, errors.New("S3 manifest remained contended after 32 CAS attempts")
+}
+
+func (s *S3Store) Finalize(repoID string, updates []RefUpdate) error {
+	txID, err := transactionID(updates)
+	if err != nil {
+		return err
+	}
+	for attempt := 0; attempt < 32; attempt++ {
+		m, etag, err := s.loadWithETag(repoID)
+		if err != nil {
+			return err
+		}
+		if _, ok := m.Prepared[txID]; !ok {
+			return nil
+		}
+		if err := failpoint("finalize.before_manifest"); err != nil {
+			return err
+		}
+		delete(m.Prepared, txID)
+		if err := s.putManifest(repoID, m, etag, false); isPrecondition(err) || isConflict(err) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		return nil
+	}
+	return errors.New("S3 manifest remained contended while finalizing transaction")
+}
+
+func (s *S3Store) Abort(repoID string, updates []RefUpdate) error {
+	txID, err := transactionID(updates)
+	if err != nil {
+		return err
+	}
+	rollbackID := "rollback-" + txID
+	transactionFile := "transactions/" + rollbackID + ".wal"
+	var rollbackHead *s3.HeadObjectOutput
+	for attempt := 0; attempt < 32; attempt++ {
+		m, etag, err := s.loadWithETag(repoID)
+		if err != nil {
+			return err
+		}
+		if _, ok := m.Prepared[txID]; !ok {
+			return nil
+		}
+		before, after := transactionState(m, updates)
+		if before {
+			delete(m.Prepared, txID)
+			if err := s.putManifest(repoID, m, etag, false); isPrecondition(err) || isConflict(err) {
+				continue
+			} else {
+				return err
+			}
+		}
+		if !after {
+			return fmt.Errorf("cannot roll back prepared transaction %s because a touched ref advanced", txID)
+		}
+		inverse := invertUpdates(updates)
+		if rollbackHead == nil {
+			rollbackHead, err = s.putMetadataTransaction(repoID, transactionFile, EntryMeta{
+				TransactionID: rollbackID, CreatedAt: time.Now().UTC(), Updates: inverse,
+			})
+			if err != nil {
+				return err
+			}
+		}
+		digest := rollbackHead.Metadata["walgit-sha256"]
+		if digest == "" {
+			return errors.New("rollback transaction is missing its SHA-256 metadata")
+		}
+		generation := m.Generation + 1
+		for _, update := range inverse {
+			if isZeroOID(update.New) {
+				delete(m.Refs, update.Ref)
+			} else {
+				m.Refs[update.Ref] = update.New
+			}
+		}
+		m.Generation = generation
+		m.Entries = append(m.Entries, ManifestEntry{
+			Generation: generation, TransactionID: rollbackID, File: transactionFile,
+			SHA256: digest, Bytes: aws.ToInt64(rollbackHead.ContentLength),
+		})
+		delete(m.Prepared, txID)
+		if err := s.putManifest(repoID, m, etag, false); isPrecondition(err) || isConflict(err) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		return nil
+	}
+	return errors.New("S3 manifest remained contended while rolling back transaction")
+}
+
+func (s *S3Store) putMetadataTransaction(repoID, transactionFile string, meta EntryMeta) (*s3.HeadObjectOutput, error) {
+	tmp, err := os.CreateTemp("", "walgit-s3-metadata-*.wal")
+	if err != nil {
+		return nil, err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if err := writeMetadataArchive(tmp, meta); err != nil {
+		tmp.Close()
+		return nil, err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, err
+	}
+	digest, size, err := fileDigest(name)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := s.context()
+	_, putErr := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(s.key(repoID, transactionFile)), Body: f,
+		ContentLength: aws.Int64(size), IfNoneMatch: aws.String("*"),
+		Metadata: map[string]string{"walgit-sha256": digest}, ContentType: aws.String("application/octet-stream"),
+	})
+	cancel()
+	closeErr := f.Close()
+	if putErr != nil && !isPrecondition(putErr) {
+		return nil, putErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return s.head(repoID, transactionFile)
+}
+
+func (s *S3Store) Load(repoID string) (Manifest, error) {
+	m, _, err := s.loadWithETag(repoID)
+	return m, err
+}
+
+func (s *S3Store) ReplayFrom(repoID string, generation uint64, gitObjects string, apply func(ManifestEntry, EntryMeta) error) (Manifest, error) {
+	m, err := s.Load(repoID)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if generation > m.Generation {
+		return Manifest{}, fmt.Errorf("local generation %d is ahead of manifest generation %d", generation, m.Generation)
+	}
+	for _, entry := range m.Entries {
+		if entry.Generation <= generation {
+			continue
+		}
+		body, err := s.get(repoID, entry.File)
+		if err != nil {
+			return Manifest{}, err
+		}
+		hash := sha256.New()
+		meta, replayErr := readArchive(io.TeeReader(body, hash), gitObjects)
+		closeErr := body.Close()
+		if replayErr != nil {
+			return Manifest{}, fmt.Errorf("replay %s: %w", entry.File, replayErr)
+		}
+		if closeErr != nil {
+			return Manifest{}, closeErr
+		}
+		if got := hex.EncodeToString(hash.Sum(nil)); got != entry.SHA256 {
+			return Manifest{}, fmt.Errorf("checksum mismatch for %s", entry.File)
+		}
+		if meta.TransactionID != entry.TransactionID {
+			return Manifest{}, fmt.Errorf("transaction mismatch for %s", entry.File)
+		}
+		if err := apply(entry, meta); err != nil {
+			return Manifest{}, fmt.Errorf("apply %s: %w", entry.File, err)
+		}
+	}
+	return m, nil
+}
+
+func (s *S3Store) CreateCheckpoint(repoID, gitObjects string, expectedGeneration uint64) (Checkpoint, error) {
+	m, _, err := s.loadWithETag(repoID)
+	if err != nil {
+		return Checkpoint{}, err
+	}
+	if m.Generation != expectedGeneration {
+		return Checkpoint{}, fmt.Errorf("manifest advanced during checkpoint: expected generation %d, found %d", expectedGeneration, m.Generation)
+	}
+	if len(m.Prepared) > 0 {
+		return Checkpoint{}, errors.New("cannot checkpoint while reference transactions are prepared")
+	}
+	tmp, err := os.CreateTemp("", "walgit-s3-checkpoint-*.wal")
+	if err != nil {
+		return Checkpoint{}, err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	meta := CheckpointMeta{
+		Generation: m.Generation, CreatedAt: time.Now().UTC(), Head: m.Head,
+		ObjectFormat: m.ObjectFormat, Refs: cloneRefs(m.Refs),
+	}
+	if err := writeCheckpointArchive(tmp, meta, gitObjects); err != nil {
+		tmp.Close()
+		return Checkpoint{}, err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return Checkpoint{}, err
+	}
+	if err := tmp.Close(); err != nil {
+		return Checkpoint{}, err
+	}
+	digest, size, err := fileDigest(name)
+	if err != nil {
+		return Checkpoint{}, err
+	}
+	checkpoint := Checkpoint{
+		Generation: m.Generation,
+		File:       fmt.Sprintf("checkpoints/%020d-%s.checkpoint", m.Generation, digest[:16]),
+		SHA256:     digest, Bytes: size,
+	}
+	f, err := os.Open(name)
+	if err != nil {
+		return Checkpoint{}, err
+	}
+	ctx, cancel := s.context()
+	_, putErr := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(s.key(repoID, checkpoint.File)), Body: f,
+		ContentLength: aws.Int64(size), IfNoneMatch: aws.String("*"),
+		Metadata: map[string]string{"walgit-sha256": digest}, ContentType: aws.String("application/octet-stream"),
+	})
+	cancel()
+	closeErr := f.Close()
+	if putErr != nil && !isPrecondition(putErr) {
+		return Checkpoint{}, putErr
+	}
+	if closeErr != nil {
+		return Checkpoint{}, closeErr
+	}
+	for attempt := 0; attempt < 32; attempt++ {
+		latest, etag, err := s.loadWithETag(repoID)
+		if err != nil {
+			return Checkpoint{}, err
+		}
+		if latest.Checkpoint != nil && latest.Checkpoint.Generation >= checkpoint.Generation {
+			checkpoint = *latest.Checkpoint
+		} else {
+			latest.Checkpoint = &checkpoint
+		}
+		kept := latest.Entries[:0]
+		for _, entry := range latest.Entries {
+			if entry.Generation > checkpoint.Generation {
+				kept = append(kept, entry)
+			}
+		}
+		latest.Entries = kept
+		if err := s.putManifest(repoID, latest, etag, false); isPrecondition(err) || isConflict(err) {
+			continue
+		} else if err != nil {
+			return Checkpoint{}, err
+		}
+		return checkpoint, nil
+	}
+	return Checkpoint{}, errors.New("S3 manifest remained contended while publishing checkpoint")
+}
+
+func (s *S3Store) RestoreCheckpoint(repoID, gitObjects string) (CheckpointMeta, error) {
+	m, err := s.Load(repoID)
+	if err != nil {
+		return CheckpointMeta{}, err
+	}
+	if m.Checkpoint == nil {
+		return CheckpointMeta{}, errors.New("manifest has no checkpoint")
+	}
+	body, err := s.get(repoID, m.Checkpoint.File)
+	if err != nil {
+		return CheckpointMeta{}, err
+	}
+	hash := sha256.New()
+	meta, restoreErr := readCheckpointArchive(io.TeeReader(body, hash), gitObjects)
+	closeErr := body.Close()
+	if restoreErr != nil {
+		return CheckpointMeta{}, restoreErr
+	}
+	if closeErr != nil {
+		return CheckpointMeta{}, closeErr
+	}
+	if got := hex.EncodeToString(hash.Sum(nil)); got != m.Checkpoint.SHA256 {
+		return CheckpointMeta{}, fmt.Errorf("checksum mismatch for checkpoint %s", m.Checkpoint.File)
+	}
+	if meta.Generation != m.Checkpoint.Generation {
+		return CheckpointMeta{}, fmt.Errorf("checkpoint generation mismatch: metadata %d, manifest %d", meta.Generation, m.Checkpoint.Generation)
+	}
+	return meta, nil
+}
+
+func (s *S3Store) CleanupPending(string, time.Time) (int, error) { return 0, nil }
+
+func (s *S3Store) GarbageCollect(repoID string, olderThan time.Time) (GCResult, error) {
+	m, err := s.Load(repoID)
+	if err != nil {
+		return GCResult{}, err
+	}
+	referenced := map[string]bool{s.key(repoID, "manifest.json"): true}
+	for _, entry := range m.Entries {
+		referenced[s.key(repoID, entry.File)] = true
+	}
+	if m.Checkpoint != nil {
+		referenced[s.key(repoID, m.Checkpoint.File)] = true
+	}
+	var result GCResult
+	var token *string
+	for {
+		ctx, cancel := s.context()
+		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket: aws.String(s.bucket), Prefix: aws.String(s.repoPrefix(repoID)), ContinuationToken: token,
+		})
+		cancel()
+		if err != nil {
+			return result, err
+		}
+		for _, object := range out.Contents {
+			key := aws.ToString(object.Key)
+			if referenced[key] || object.LastModified == nil || !object.LastModified.Before(olderThan) {
+				continue
+			}
+			ctx, cancel := s.context()
+			_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
+			cancel()
+			if err != nil {
+				return result, err
+			}
+			if strings.Contains(key, "/checkpoints/") {
+				result.Checkpoints++
+			} else if strings.Contains(key, "/transactions/") {
+				result.Entries++
+			}
+		}
+		if !aws.ToBool(out.IsTruncated) || out.NextContinuationToken == nil {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+	return result, nil
+}
+
+func (s *S3Store) loadWithETag(repoID string) (Manifest, string, error) {
+	ctx, cancel := s.context()
+	defer cancel()
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(s.key(repoID, "manifest.json")),
+	})
+	if err != nil {
+		return Manifest{}, "", err
+	}
+	defer out.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(out.Body, 64<<20))
+	if err != nil {
+		return Manifest{}, "", err
+	}
+	m, err := decodeManifest(data)
+	return m, aws.ToString(out.ETag), err
+}
+
+func (s *S3Store) putManifest(repoID string, m Manifest, etag string, create bool) error {
+	data, err := marshalManifest(m)
+	if err != nil {
+		return err
+	}
+	input := &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(s.key(repoID, "manifest.json")),
+		Body: strings.NewReader(string(data)), ContentLength: aws.Int64(int64(len(data))), ContentType: aws.String("application/json"),
+	}
+	if !s.unconditionalWrites {
+		if create {
+			input.IfNoneMatch = aws.String("*")
+		} else {
+			input.IfMatch = aws.String(etag)
+		}
+	}
+	ctx, cancel := s.context()
+	defer cancel()
+	_, err = s.client.PutObject(ctx, input)
+	return err
+}
+
+func (s *S3Store) get(repoID, relative string) (io.ReadCloser, error) {
+	ctx, cancel := s.context()
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(s.key(repoID, relative)),
+	})
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return &cancelReadCloser{ReadCloser: out.Body, cancel: cancel}, nil
+}
+
+func (s *S3Store) head(repoID, relative string) (*s3.HeadObjectOutput, error) {
+	ctx, cancel := s.context()
+	defer cancel()
+	return s.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(s.key(repoID, relative)),
+	})
+}
+
+func (s *S3Store) key(repoID, relative string) string {
+	return path.Join(s.prefix, repoID, filepath.ToSlash(relative))
+}
+
+func (s *S3Store) repoPrefix(repoID string) string { return s.key(repoID, "") + "/" }
+
+func DeleteS3Repository(location, repoID string) error {
+	if !strings.HasPrefix(location, "s3://") {
+		return errors.New("S3 cleanup requires an s3:// location")
+	}
+	_, prefix, ok := strings.Cut(strings.TrimPrefix(location, "s3://"), "/")
+	if !ok {
+		return errors.New("refusing S3 cleanup without an isolated prefix")
+	}
+	isolated := false
+	for _, segment := range strings.Split(prefix, "/") {
+		if strings.HasPrefix(segment, "walgit-benchmark-") {
+			isolated = true
+			break
+		}
+	}
+	if !isolated {
+		return errors.New("refusing S3 cleanup outside a walgit-benchmark-* prefix")
+	}
+	backend, err := OpenS3(location)
+	if err != nil {
+		return err
+	}
+	store, ok := backend.(*S3Store)
+	if !ok {
+		return errors.New("S3 cleanup opened an unexpected backend")
+	}
+	return store.deleteRepository(repoID)
+}
+
+func (s *S3Store) deleteRepository(repoID string) error {
+	if err := validateID(repoID); err != nil {
+		return err
+	}
+	var token *string
+	var keys []string
+	for {
+		ctx, cancel := s.context()
+		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket: aws.String(s.bucket), Prefix: aws.String(s.repoPrefix(repoID)), ContinuationToken: token,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+		for _, object := range out.Contents {
+			keys = append(keys, aws.ToString(object.Key))
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+	for _, key := range keys {
+		ctx, cancel := s.context()
+		_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
+		cancel()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *S3Store) context() (context.Context, context.CancelFunc) {
+	timeout := s.timeout
+	if timeout == 0 {
+		timeout = 2 * time.Minute
+	}
+	return context.WithTimeout(context.Background(), timeout)
+}
+
+func isPrecondition(err error) bool { return apiErrorCode(err, "PreconditionFailed", 412) }
+func isConflict(err error) bool     { return apiErrorCode(err, "ConditionalRequestConflict", 409) }
+func isNotFound(err error) bool {
+	return apiErrorCode(err, "NoSuchKey", 404) || apiErrorCode(err, "NotFound", 404)
+}
+
+func apiErrorCode(err error, code string, status int) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == code {
+		return true
+	}
+	var responseErr *awshttp.ResponseError
+	return errors.As(err, &responseErr) && responseErr.HTTPStatusCode() == status
+}
+
+func marshalManifest(m Manifest) ([]byte, error) {
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(data, '\n'), nil
+}
+
+func decodeManifest(data []byte) (Manifest, error) {
+	var m Manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return Manifest{}, err
+	}
+	if m.Version != manifestVersion {
+		return Manifest{}, fmt.Errorf("unsupported manifest version %d", m.Version)
+	}
+	if m.Refs == nil {
+		m.Refs = map[string]string{}
+	}
+	return m, nil
+}
+
+type cancelReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (r *cancelReadCloser) Close() error {
+	err := r.ReadCloser.Close()
+	r.cancel()
+	return err
+}
