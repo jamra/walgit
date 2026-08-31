@@ -157,6 +157,10 @@ The coordinator is repository-scoped. It retains one backend session, avoids
 redundant transaction and manifest reads, treats manifest publication as the
 durable commit point, and appends a compensating WAL entry if Git explicitly
 aborts afterward. Run only one coordinator for a Spaces-backed repository.
+The `gateway` or `serve` process and its Git hooks must inherit the same
+`WALGIT_WRITER_SOCKET` value. Protect the socket as owner-only and supervise the
+writer as a required dependency: if it is configured but unavailable, Git
+requests fail closed instead of bypassing serialization.
 
 The following two-node runs used 100 pushes with 64 KiB changed per push. The
 same-region runs executed on a temporary 2-vCPU machine in `nyc3` beside the
@@ -305,6 +309,9 @@ reconstructs refs and objects from the latest checkpoint plus WAL tail.
 - The manifest contains authoritative refs, symbolic `HEAD`, and object format.
 - Transactions are immutable and idempotent.
 - Expected old ref values are checked against the manifest, not only local Git.
+- Reference-transaction notifications for symbolic `HEAD`, emitted by newer
+  Git versions such as 2.43, are ignored while every actual `refs/*` update
+  remains strictly parsed and validated against the staged transaction.
 - Conditional-CAS updates remain marked as prepared and lock their touched refs
   until Git reports `committed` or `aborted`.
 - A coordinated single writer uses manifest publication itself as the durable
