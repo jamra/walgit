@@ -5,6 +5,8 @@ inspired by Cursor's Continuity architecture. Normal bare Git repositories are
 disposable serving caches; the versioned manifest and immutable WAL entries are
 the authoritative repository state.
 
+Licensed under the [MIT License](LICENSE).
+
 The filesystem backend provides a local correctness and performance baseline.
 The S3-compatible backend stores immutable transactions and checkpoints as
 objects. Stores that support conditional `PutObject` requests linearize
