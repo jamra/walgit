@@ -130,5 +130,6 @@ payloads across primary loss for repositories initialized in dual-authority
 mode. `walgit scrub` supports continuous verification of both copies, and
 `walgit repair` provides a conservative, separately credentialed repair path;
 see the [runbook](scrub-repair.md). Independently enforced retention and
-recurring disaster-restore drills remain required. See the
+recurring disaster-restore drills remain required. S3 retention enforcement is
+described in the [retention runbook](retention.md). See the
 [reliability model](reliability.md) for the exact boundary.

@@ -48,6 +48,7 @@ type ScrubReport struct {
 	Generation        uint64                 `json:"generation"`
 	CertificateSHA256 string                 `json:"certificate_sha256,omitempty"`
 	Authorities       []AuthorityScrubReport `json:"authorities"`
+	Retention         *RetentionReport       `json:"retention,omitempty"`
 	Issues            []ScrubIssue           `json:"issues,omitempty"`
 }
 
@@ -96,6 +97,12 @@ func Scrub(location, repoID string) (ScrubReport, error) {
 		return ScrubReport{Version: scrubReportVersion, Repository: repoID}, err
 	}
 	report, _ := scrubAuthorities(repoID, authorities)
+	retention, retentionErr := checkMaintenanceRetention(authorities)
+	report.Retention = retention
+	if retentionErr != nil {
+		report.Healthy = false
+		report.Issues = append(report.Issues, ScrubIssue{Kind: "retention", Message: retentionErr.Error()})
+	}
 	if !report.Healthy {
 		return report, errors.New("durability scrub failed")
 	}
@@ -119,8 +126,18 @@ func Repair(location, repoID, sourceName string) (RepairReport, error) {
 	}
 	targetIndex := 1 - sourceIndex
 	report.Target = authorities[targetIndex].name
+	retention, retentionErr := checkMaintenanceRetention(authorities)
+	if retentionErr != nil {
+		return report, fmt.Errorf("refusing repair: %w", retentionErr)
+	}
+	if retention != nil {
+		if err := configureRetentionFromReport(authorities, *retention); err != nil {
+			return report, fmt.Errorf("refusing repair: %w", err)
+		}
+	}
 
 	before, snapshots := scrubAuthorities(repoID, authorities)
+	before.Retention = retention
 	report.Before = before
 	sourceReport := before.Authorities[sourceIndex]
 	targetReport := before.Authorities[targetIndex]
@@ -191,6 +208,7 @@ func Repair(location, repoID, sourceName string) (RepairReport, error) {
 	}
 
 	after, _ := scrubAuthorities(repoID, authorities)
+	after.Retention = retention
 	report.After = after
 	if !after.Healthy || after.CertificateSHA256 != snapshot.headDigest {
 		return report, errors.New("repair did not produce two matching fully verified authorities")

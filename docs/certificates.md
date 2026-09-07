@@ -13,6 +13,8 @@ export WALGIT_BLOB_SECONDARY_STORE=s3://independent-account/walgit
 export WALGIT_REQUIRE_DUAL_AUTHORITY=true
 export WALGIT_S3_DISABLE_CONDITIONAL_WRITES=true
 export WALGIT_WRITER_SOCKET=/run/walgit/origin.sock
+export WALGIT_MIN_RETENTION=720h
+export WALGIT_RETENTION_MODE=compliance
 ```
 
 The secondary credential and endpoint overrides are documented in
@@ -21,8 +23,9 @@ the same protocol and serialize publication with the manifest lock.
 
 `WALGIT_REQUIRE_DUAL_AUTHORITY` implies replicated blobs. It fails startup when
 the secondary is absent or aliases the primary. S3 startup also fails unless
-single-writer mode is enabled. The writer socket must be supervised and exposed
-only to the repository's Git gateway and hooks.
+single-writer mode is enabled and both authorities satisfy the configured
+[retention policy](retention.md). The writer socket must be supervised and
+exposed only to the repository's Git gateway and hooks.
 
 ## Certificate format
 
@@ -127,7 +130,8 @@ that migration command is not implemented yet.
 The foreground protocol prevents acknowledgement before two verified copies,
 but durability is also a continuing operational property:
 
-- enable independently administered retention or Object Lock;
+- keep independently administered Object Lock enabled and monitor the enforced
+  retention policy;
 - deny overwrite and delete privileges to foreground writers;
 - continuously run `walgit scrub` over every chain, descriptor, and chunk;
 - use `walgit repair` with separate audited credentials when one authority is
@@ -136,5 +140,4 @@ but durability is also a continuing operational property:
 - restore regularly into an isolated account and run `git fsck --strict`.
 
 Certificate and content-addressed blob garbage collection remain disabled until
-dual-authority reachability and independently enforced retention are
-implemented.
+dual-authority reachability is implemented.

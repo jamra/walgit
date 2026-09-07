@@ -1,6 +1,8 @@
 package app
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -124,6 +127,129 @@ func TestInterruptedCacheEvictionIsRecoveredAtStartup(t *testing.T) {
 	}
 	if _, err := os.Stat(evictionBackupPath(repo)); !os.IsNotExist(err) {
 		t.Fatalf("eviction recovery path still exists: %v", err)
+	}
+}
+
+func TestScrubHealthStopsWritesAndMaintenanceUntilRepair(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo.git")
+	primary := filepath.Join(root, "primary")
+	secondary := filepath.Join(root, "secondary")
+	t.Setenv("WALGIT_REQUIRE_DUAL_AUTHORITY", "true")
+	t.Setenv("WALGIT_BLOB_SECONDARY_STORE", secondary)
+	if err := Init(repo, primary, "repo"); err != nil {
+		t.Fatal(err)
+	}
+	handler, err := newGitHTTPHandler(HTTPOptions{
+		Repository: repo, Store: primary, RepositoryID: "repo", Token: "secret",
+		ScrubInterval: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.readinessError(); err == nil || !strings.Contains(err.Error(), "initial durability scrub") {
+		t.Fatalf("handler was ready before its initial scrub: %v", err)
+	}
+	if report, err := handler.runScrub(); err != nil || !report.Healthy {
+		t.Fatalf("initial scrub failed: report=%#v err=%v", report, err)
+	}
+	if err := handler.readinessError(); err != nil {
+		t.Fatalf("handler was not ready after a successful scrub: %v", err)
+	}
+
+	certificates, err := filepath.Glob(filepath.Join(secondary, ".walgit-certificates", "repo", "*.cert"))
+	if err != nil || len(certificates) != 1 {
+		t.Fatalf("secondary certificates = %v, err=%v", certificates, err)
+	}
+	if err := os.Remove(certificates[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handler.runScrub(); err == nil {
+		t.Fatal("scrub accepted a missing secondary certificate")
+	}
+	if err := handler.readinessError(); err == nil {
+		t.Fatal("unhealthy scrub did not fail readiness")
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://walgit.test/repo.git/info/refs?service=git-receive-pack", nil)
+	request.Header.Set("Authorization", "Bearer secret")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "writes disabled") {
+		t.Fatalf("write was not stopped after scrub failure: status=%d body=%s", response.Code, response.Body.String())
+	}
+	if _, err := handler.runMaintenance(); err == nil {
+		t.Fatal("maintenance continued while durability scrub was unhealthy")
+	}
+
+	if _, err := wal.Repair(primary, "repo", "primary"); err != nil {
+		t.Fatal(err)
+	}
+	if report, err := handler.runScrub(); err != nil || !report.Healthy {
+		t.Fatalf("scrub did not recover after repair: report=%#v err=%v", report, err)
+	}
+	if err := handler.readinessError(); err != nil {
+		t.Fatalf("handler remained unhealthy after repair: %v", err)
+	}
+	var metrics bytes.Buffer
+	handler.metrics.render(&metrics, "repo", true)
+	for _, metric := range []string{
+		`walgit_scrub_configured{repository="repo"} 1`,
+		`walgit_scrub_healthy{repository="repo"} 1`,
+		`walgit_scrub_runs_total{repository="repo"} 3`,
+		`walgit_scrub_failures_total{repository="repo"} 1`,
+		`walgit_maintenance_failures_total{repository="repo"} 1`,
+	} {
+		if !strings.Contains(metrics.String(), metric) {
+			t.Fatalf("metrics do not contain %q: %s", metric, metrics.String())
+		}
+	}
+}
+
+func TestScheduledScrubLoopRuns(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo.git")
+	primary := filepath.Join(root, "primary")
+	secondary := filepath.Join(root, "secondary")
+	t.Setenv("WALGIT_REQUIRE_DUAL_AUTHORITY", "true")
+	t.Setenv("WALGIT_BLOB_SECONDARY_STORE", secondary)
+	if err := Init(repo, primary, "repo"); err != nil {
+		t.Fatal(err)
+	}
+	handler, err := newGitHTTPHandler(HTTPOptions{
+		Repository: repo, Store: primary, RepositoryID: "repo", Token: "secret",
+		ScrubInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var group sync.WaitGroup
+	group.Add(1)
+	go handler.runScrubLoop(ctx, &group)
+	deadline := time.NewTimer(2 * time.Second)
+	poll := time.NewTicker(5 * time.Millisecond)
+	defer deadline.Stop()
+	defer poll.Stop()
+	for {
+		handler.metrics.mu.Lock()
+		runs := handler.metrics.scrubRuns
+		handler.metrics.mu.Unlock()
+		if runs > 0 {
+			break
+		}
+		select {
+		case <-deadline.C:
+			cancel()
+			group.Wait()
+			t.Fatal("scheduled scrub did not run")
+		case <-poll.C:
+		}
+	}
+	cancel()
+	group.Wait()
+	if err := handler.metrics.scrubHealthError(); err != nil {
+		t.Fatalf("scheduled scrub was unhealthy: %v", err)
 	}
 }
 

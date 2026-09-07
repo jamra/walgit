@@ -25,12 +25,14 @@ func (s s3BlobStore) Put(ref ChunkRef, data []byte) error {
 	decoded, _ := hex.DecodeString(ref.SHA256)
 	checksum := base64.StdEncoding.EncodeToString(decoded)
 	ctx, cancel := s.store.context()
-	out, putErr := s.store.client.PutObject(ctx, &s3.PutObjectInput{
+	input := &s3.PutObjectInput{
 		Bucket: aws.String(s.store.bucket), Key: aws.String(s.store.blobKey(ref.SHA256)),
 		Body: bytes.NewReader(data), ContentLength: aws.Int64(ref.Bytes), IfNoneMatch: aws.String("*"),
 		ChecksumAlgorithm: types.ChecksumAlgorithmSha256, ChecksumSHA256: aws.String(checksum),
 		Metadata: map[string]string{"walgit-sha256": ref.SHA256}, ContentType: aws.String("application/octet-stream"),
-	})
+	}
+	s.store.applyRetention(input)
+	out, putErr := s.store.client.PutObject(ctx, input)
 	cancel()
 	if putErr != nil {
 		existing, getErr := s.Get(ref)

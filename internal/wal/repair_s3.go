@@ -76,6 +76,7 @@ func (s s3BlobStore) putRepairObject(key, digest string, data []byte, contentTyp
 	if immutable {
 		input.IfNoneMatch = aws.String("*")
 	}
+	s.store.applyRetention(input)
 	ctx, cancel := s.store.context()
 	out, err := s.store.client.PutObject(ctx, input)
 	cancel()

@@ -32,6 +32,9 @@ func (h *gitHTTPHandler) runMaintenance() (result MaintenanceResult, err error) 
 			h.metrics.mu.Unlock()
 		}
 	}()
+	if err := h.metrics.scrubHealthError(); err != nil {
+		return result, err
+	}
 	if err := recoverCacheEviction(h.options.Repository, h.options.Store, h.options.RepositoryID); err != nil {
 		return result, err
 	}

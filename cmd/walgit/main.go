@@ -103,6 +103,17 @@ func main() {
 		if encodeErr := json.NewEncoder(os.Stdout).Encode(report); encodeErr != nil && err == nil {
 			err = encodeErr
 		}
+	case "retention-check":
+		fs := flag.NewFlagSet("retention-check", flag.ExitOnError)
+		store := fs.String("store", "", "s3:// URI for the primary durable authority")
+		minimum := fs.Duration("minimum", 30*24*time.Hour, "minimum default retention period")
+		mode := fs.String("mode", "compliance", "required Object Lock mode: compliance or governance")
+		_ = fs.Parse(os.Args[2:])
+		var report any
+		report, err = app.CheckRetention(*store, *minimum, *mode)
+		if encodeErr := json.NewEncoder(os.Stdout).Encode(report); encodeErr != nil && err == nil {
+			err = encodeErr
+		}
 	case "serve":
 		fs := flag.NewFlagSet("serve", flag.ExitOnError)
 		listen := fs.String("listen", "127.0.0.1:8080", "HTTP listen address")
@@ -114,6 +125,7 @@ func main() {
 		anonymousRead := fs.Bool("anonymous-read", false, "allow unauthenticated clone and fetch")
 		maxRequest := fs.Int64("max-request-bytes", 1<<30, "maximum Git HTTP request size")
 		maintenanceInterval := fs.Duration("maintenance-interval", 5*time.Minute, "checkpoint, garbage collection, and eviction check interval; 0 disables")
+		scrubInterval := fs.Duration("scrub-interval", 0, "dual-authority integrity scrub interval; 0 disables")
 		compactEntries := fs.Int("compact-after-entries", 100, "checkpoint after this many WAL entries; 0 disables this threshold")
 		compactBytes := fs.Int64("compact-after-bytes", 1<<30, "checkpoint after this many WAL bytes; 0 disables this threshold")
 		gcGrace := fs.Duration("gc-grace", 24*time.Hour, "minimum age for unreferenced durable objects")
@@ -127,6 +139,7 @@ func main() {
 				Token: os.Getenv("WALGIT_HTTP_TOKEN"), AuthorizationFile: *authFile,
 				AnonymousRead: *anonymousRead, MaximumRequestSize: *maxRequest,
 				MaintenanceInterval: *maintenanceInterval, CompactAfterEntries: *compactEntries,
+				ScrubInterval:     *scrubInterval,
 				CompactAfterBytes: *compactBytes, GCGrace: *gcGrace, IdleCacheAfter: *idleCacheAfter,
 			})
 		}
@@ -171,5 +184,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: walgit <init|hook|restore|reconcile|gateway|compact|gc|scrub|repair|serve|writer|bench> [options]")
+	fmt.Fprintln(os.Stderr, "usage: walgit <init|hook|restore|reconcile|gateway|compact|gc|scrub|repair|retention-check|serve|writer|bench> [options]")
 }

@@ -32,6 +32,7 @@ type HostRepositoryConfig struct {
 	AnonymousRead       bool   `json:"anonymous_read,omitempty"`
 	MaximumRequestSize  *int64 `json:"maximum_request_bytes,omitempty"`
 	MaintenanceInterval string `json:"maintenance_interval,omitempty"`
+	ScrubInterval       string `json:"scrub_interval,omitempty"`
 	CompactAfterEntries *int   `json:"compact_after_entries,omitempty"`
 	CompactAfterBytes   *int64 `json:"compact_after_bytes,omitempty"`
 	GCGrace             string `json:"gc_grace,omitempty"`
@@ -115,6 +116,10 @@ func (c HostRepositoryConfig) httpOptions(repo, store, authFile, token string) (
 	if err != nil {
 		return HTTPOptions{}, fmt.Errorf("maintenance interval: %w", err)
 	}
+	scrubInterval, err := parseConfigDuration(c.ScrubInterval, 0)
+	if err != nil {
+		return HTTPOptions{}, fmt.Errorf("scrub interval: %w", err)
+	}
 	gcGrace, err := parseConfigDuration(c.GCGrace, 24*time.Hour)
 	if err != nil {
 		return HTTPOptions{}, fmt.Errorf("GC grace: %w", err)
@@ -139,6 +144,7 @@ func (c HostRepositoryConfig) httpOptions(repo, store, authFile, token string) (
 		Repository: repo, Store: store, RepositoryID: c.ID,
 		Token: token, AuthorizationFile: authFile, AnonymousRead: c.AnonymousRead,
 		MaximumRequestSize: maxRequest, MaintenanceInterval: maintenanceInterval,
+		ScrubInterval:       scrubInterval,
 		CompactAfterEntries: compactEntries, CompactAfterBytes: compactBytes,
 		GCGrace: gcGrace, IdleCacheAfter: idleCacheAfter,
 	}, nil
@@ -245,6 +251,9 @@ func (h *gitHTTPHost) serveOperationalEndpoint(w http.ResponseWriter, r *http.Re
 func (h *gitHTTPHandler) readinessError() error {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
+	if err := h.metrics.scrubHealthError(); err != nil {
+		return err
+	}
 	backend, err := wal.Open(h.options.Store)
 	if err == nil {
 		_, err = backend.Load(h.options.RepositoryID)
@@ -265,23 +274,27 @@ func ServeGitHTTPHost(listen, configPath, authorizationOverride, sharedToken str
 	var maintenance sync.WaitGroup
 	for _, id := range host.ids {
 		handler := host.repositories[id]
-		if handler.options.MaintenanceInterval <= 0 {
-			continue
+		if handler.options.ScrubInterval > 0 {
+			_, _ = handler.runScrub()
+			maintenance.Add(1)
+			go handler.runScrubLoop(ctx, &maintenance)
 		}
-		maintenance.Add(1)
-		go func() {
-			defer maintenance.Done()
-			ticker := time.NewTicker(handler.options.MaintenanceInterval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					_, _ = handler.runMaintenance()
+		if handler.options.MaintenanceInterval > 0 {
+			maintenance.Add(1)
+			go func() {
+				defer maintenance.Done()
+				ticker := time.NewTicker(handler.options.MaintenanceInterval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						_, _ = handler.runMaintenance()
+					}
 				}
-			}
-		}()
+			}()
+		}
 	}
 	server := &http.Server{Addr: listen, Handler: host, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
 	serverError := make(chan error, 1)

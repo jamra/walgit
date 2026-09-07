@@ -31,6 +31,7 @@ type HTTPOptions struct {
 	AnonymousRead       bool
 	MaximumRequestSize  int64
 	MaintenanceInterval time.Duration
+	ScrubInterval       time.Duration
 	CompactAfterEntries int
 	CompactAfterBytes   int64
 	GCGrace             time.Duration
@@ -66,6 +67,9 @@ func newGitHTTPHandler(options HTTPOptions) (*gitHTTPHandler, error) {
 	if options.GCGrace < 0 {
 		return nil, errors.New("garbage-collection grace period cannot be negative")
 	}
+	if options.ScrubInterval < 0 {
+		return nil, errors.New("scrub interval cannot be negative")
+	}
 	authorizer, err := loadAuthorizer(options.RepositoryID, options.Token, options.AuthorizationFile)
 	if err != nil {
 		return nil, err
@@ -73,7 +77,9 @@ func newGitHTTPHandler(options HTTPOptions) (*gitHTTPHandler, error) {
 	if err := recoverCacheEviction(options.Repository, options.Store, options.RepositoryID); err != nil {
 		return nil, fmt.Errorf("recover repository cache: %w", err)
 	}
-	return &gitHTTPHandler{options: options, authorizer: authorizer, metrics: newServerMetrics()}, nil
+	handler := &gitHTTPHandler{options: options, authorizer: authorizer, metrics: newServerMetrics()}
+	handler.metrics.configureScrub(options.ScrubInterval > 0)
+	return handler, nil
 }
 
 func ServeGitHTTP(listen string, options HTTPOptions) error {
@@ -87,10 +93,16 @@ func ServeGitHTTP(listen string, options HTTPOptions) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	maintenanceDone := make(chan struct{})
+	var background sync.WaitGroup
+	if options.ScrubInterval > 0 {
+		_, _ = handler.runScrub()
+		background.Add(1)
+		go handler.runScrubLoop(ctx, &background)
+	}
 	if options.MaintenanceInterval > 0 {
+		background.Add(1)
 		go func() {
-			defer close(maintenanceDone)
+			defer background.Done()
 			ticker := time.NewTicker(options.MaintenanceInterval)
 			defer ticker.Stop()
 			for {
@@ -102,17 +114,13 @@ func ServeGitHTTP(listen string, options HTTPOptions) error {
 				}
 			}
 		}()
-	} else {
-		close(maintenanceDone)
 	}
 	serverError := make(chan error, 1)
 	go func() { serverError <- server.ListenAndServe() }()
 	select {
 	case err := <-serverError:
 		stop()
-		select {
-		case <-maintenanceDone:
-		case <-time.After(30 * time.Second):
+		if !waitGroupWithin(&background, 30*time.Second) {
 			return errors.New("timed out waiting for maintenance shutdown")
 		}
 		if errors.Is(err, http.ErrServerClosed) {
@@ -124,9 +132,7 @@ func ServeGitHTTP(listen string, options HTTPOptions) error {
 		defer cancel()
 		err := server.Shutdown(shutdownCtx)
 		serverErr := <-serverError
-		select {
-		case <-maintenanceDone:
-		case <-shutdownCtx.Done():
+		if !waitGroupWithin(&background, 30*time.Second) {
 			return errors.New("timed out waiting for maintenance shutdown")
 		}
 		if err != nil {
@@ -170,6 +176,10 @@ func (h *gitHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if write {
 		h.mu.Lock()
 		defer h.mu.Unlock()
+		if err := h.metrics.scrubHealthError(); err != nil {
+			http.Error(tracked, "writes disabled: durability scrub is unhealthy", http.StatusServiceUnavailable)
+			return
+		}
 	} else {
 		h.mu.RLock()
 		defer h.mu.RUnlock()

@@ -47,6 +47,8 @@ type S3Store struct {
 	cachedETag          string
 	blobs               blobStore
 	certificates        certificateStore
+	retentionMode       types.ObjectLockMode
+	retentionFor        time.Duration
 }
 
 type stagedS3Transaction struct {
@@ -185,6 +187,12 @@ func OpenS3(location string) (Backend, error) {
 	if certificates != nil && !store.unconditionalWrites {
 		return nil, errors.New("dual-authority certificates require WALGIT_S3_DISABLE_CONDITIONAL_WRITES=true and one repository writer")
 	}
+	allowUnprotected, _ := strconv.ParseBool(os.Getenv("WALGIT_ALLOW_UNPROTECTED_S3"))
+	if certificates != nil && !allowUnprotected {
+		if err := enforceConfiguredRetention(certificates); err != nil {
+			return nil, err
+		}
+	}
 	store.blobs = blobs
 	store.certificates = certificates
 	return store, nil
@@ -265,10 +273,35 @@ func openS3Configured(location string, secondary, repair bool) (*S3Store, error)
 		}
 	})
 	unconditional, _ := strconv.ParseBool(os.Getenv("WALGIT_S3_DISABLE_CONDITIONAL_WRITES"))
-	return &S3Store{
+	store := &S3Store{
 		client: client, bucket: bucket, prefix: strings.Trim(prefix, "/"), timeout: 2 * time.Minute,
 		unconditionalWrites: unconditional, staged: make(map[string]stagedS3Transaction),
-	}, nil
+	}
+	if repair {
+		allowUnprotected, _ := strconv.ParseBool(os.Getenv("WALGIT_ALLOW_UNPROTECTED_S3"))
+		if !allowUnprotected {
+			policy, err := retentionPolicyFromEnvironment()
+			if err != nil {
+				return nil, err
+			}
+			store.configureRetention(policy)
+		}
+	}
+	return store, nil
+}
+
+func (s *S3Store) configureRetention(policy RetentionPolicy) {
+	s.retentionMode = types.ObjectLockMode(policy.Mode)
+	s.retentionFor = policy.Minimum
+}
+
+func (s *S3Store) applyRetention(input *s3.PutObjectInput) {
+	if s.retentionFor <= 0 {
+		return
+	}
+	retainUntil := time.Now().UTC().Add(s.retentionFor)
+	input.ObjectLockMode = s.retentionMode
+	input.ObjectLockRetainUntilDate = &retainUntil
 }
 
 func (s *S3Store) Initialize(repoID, head, objectFormat string) error {

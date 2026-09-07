@@ -24,12 +24,14 @@ func (s s3BlobStore) PutCertificate(repoID string, generation uint64, digest str
 	checksum := base64.StdEncoding.EncodeToString(decoded)
 	key := s.certificateKey(repoID, generation, digest)
 	ctx, cancel := s.store.context()
-	out, putErr := s.store.client.PutObject(ctx, &s3.PutObjectInput{
+	input := &s3.PutObjectInput{
 		Bucket: aws.String(s.store.bucket), Key: aws.String(key), Body: bytes.NewReader(data),
 		ContentLength: aws.Int64(int64(len(data))), IfNoneMatch: aws.String("*"),
 		ChecksumAlgorithm: types.ChecksumAlgorithmSha256, ChecksumSHA256: aws.String(checksum),
 		Metadata: map[string]string{"walgit-sha256": digest}, ContentType: aws.String("application/json"),
-	})
+	}
+	s.store.applyRetention(input)
+	out, putErr := s.store.client.PutObject(ctx, input)
 	cancel()
 	if putErr != nil {
 		existing, getErr := s.getCertificate(key, digest)

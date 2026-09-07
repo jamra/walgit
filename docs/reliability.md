@@ -181,6 +181,8 @@ not make that statement timeless. The remaining operational protocol is:
 
 1. Enable versioning and retention/Object Lock independently on both sides,
    using credentials that cannot shorten retention or delete retained data.
+   Strict S3 startup validates this policy and sends explicit retention on
+   immutable writes; see the [retention runbook](retention.md).
 2. Continuously run `walgit scrub` against both copies and alert on any nonzero
    result.
 3. Stop the repository writer and use `walgit repair` with separately
@@ -209,5 +211,6 @@ substitutes for two independent durable authorities.
   reachability is implemented.
 - Deletion credentials must be separate from foreground writer credentials.
 - Retention must exceed the longest credible detection and recovery window.
-- A scrub or repair mismatch must stop garbage collection and alert an
-  operator; it must never choose a winner silently.
+- A configured server scrub mismatch stops writes, readiness, and garbage
+  collection and exposes alertable metrics; repair never chooses a winner
+  silently.

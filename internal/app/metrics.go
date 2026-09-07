@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -8,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"walgit/internal/wal"
 )
 
 type serverMetrics struct {
@@ -28,6 +31,15 @@ type serverMetrics struct {
 	compactions         uint64
 	garbageCollections  uint64
 	evictions           uint64
+	scrubConfigured     bool
+	scrubHealthy        bool
+	scrubRuns           uint64
+	scrubFailures       uint64
+	scrubSeconds        float64
+	scrubLastRun        time.Time
+	scrubLastSuccess    time.Time
+	scrubGeneration     uint64
+	scrubError          string
 }
 
 func newServerMetrics() *serverMetrics {
@@ -73,6 +85,45 @@ func (m *serverMetrics) recordBackend(elapsed time.Duration, err error) {
 	m.mu.Unlock()
 }
 
+func (m *serverMetrics) configureScrub(configured bool) {
+	m.mu.Lock()
+	m.scrubConfigured = configured
+	if configured {
+		m.scrubError = "initial durability scrub has not completed"
+	}
+	m.mu.Unlock()
+}
+
+func (m *serverMetrics) recordScrub(report wal.ScrubReport, elapsed time.Duration, err error) {
+	m.mu.Lock()
+	m.scrubRuns++
+	m.scrubSeconds += elapsed.Seconds()
+	m.scrubLastRun = time.Now().UTC()
+	m.scrubHealthy = err == nil && report.Healthy
+	if m.scrubHealthy {
+		m.scrubLastSuccess = m.scrubLastRun
+		m.scrubGeneration = report.Generation
+		m.scrubError = ""
+	} else {
+		m.scrubFailures++
+		if err != nil {
+			m.scrubError = err.Error()
+		} else {
+			m.scrubError = "durability scrub reported an unhealthy state"
+		}
+	}
+	m.mu.Unlock()
+}
+
+func (m *serverMetrics) scrubHealthError() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.scrubConfigured || m.scrubHealthy {
+		return nil
+	}
+	return errors.New(m.scrubError)
+}
+
 func (m *serverMetrics) render(w io.Writer, repository string, includeMetadata bool) {
 	m.mu.Lock()
 	requests := make(map[string]uint64, len(m.requests))
@@ -84,6 +135,9 @@ func (m *serverMetrics) render(w io.Writer, repository string, includeMetadata b
 	backendCount, backendFailures, backendSeconds := m.backendCount, m.backendFailures, m.backendSeconds
 	maintenanceRuns, maintenanceFailures := m.maintenanceRuns, m.maintenanceFailures
 	compactions, garbageCollections, evictions := m.compactions, m.garbageCollections, m.evictions
+	scrubConfigured, scrubHealthy := m.scrubConfigured, m.scrubHealthy
+	scrubRuns, scrubFailures, scrubSeconds := m.scrubRuns, m.scrubFailures, m.scrubSeconds
+	scrubLastRun, scrubLastSuccess, scrubGeneration := m.scrubLastRun, m.scrubLastSuccess, m.scrubGeneration
 	m.mu.Unlock()
 
 	if includeMetadata {
@@ -111,6 +165,14 @@ func (m *serverMetrics) render(w io.Writer, repository string, includeMetadata b
 	fmt.Fprintf(w, "walgit_compactions_total{repository=%q} %d\n", repository, compactions)
 	fmt.Fprintf(w, "walgit_garbage_collections_total{repository=%q} %d\n", repository, garbageCollections)
 	fmt.Fprintf(w, "walgit_cache_evictions_total{repository=%q} %d\n", repository, evictions)
+	fmt.Fprintf(w, "walgit_scrub_configured{repository=%q} %d\n", repository, boolMetric(scrubConfigured))
+	fmt.Fprintf(w, "walgit_scrub_healthy{repository=%q} %d\n", repository, boolMetric(scrubHealthy))
+	fmt.Fprintf(w, "walgit_scrub_runs_total{repository=%q} %d\n", repository, scrubRuns)
+	fmt.Fprintf(w, "walgit_scrub_failures_total{repository=%q} %d\n", repository, scrubFailures)
+	fmt.Fprintf(w, "walgit_scrub_seconds_total{repository=%q} %.9f\n", repository, scrubSeconds)
+	fmt.Fprintf(w, "walgit_scrub_last_run_timestamp_seconds{repository=%q} %.3f\n", repository, timestampMetric(scrubLastRun))
+	fmt.Fprintf(w, "walgit_scrub_last_success_timestamp_seconds{repository=%q} %.3f\n", repository, timestampMetric(scrubLastSuccess))
+	fmt.Fprintf(w, "walgit_scrub_generation{repository=%q} %d\n", repository, scrubGeneration)
 	fmt.Fprintf(w, "walgit_last_activity_timestamp_seconds{repository=%q} %.3f\n", repository, float64(m.lastActivity.Load())/float64(time.Second))
 }
 
@@ -132,10 +194,32 @@ func writeMetricMetadata(w io.Writer) {
 		{"walgit_compactions_total", "counter", "Completed repository checkpoints."},
 		{"walgit_garbage_collections_total", "counter", "Completed garbage-collection passes."},
 		{"walgit_cache_evictions_total", "counter", "Completed local cache evictions."},
+		{"walgit_scrub_configured", "gauge", "Whether continuous dual-authority scrubbing is configured."},
+		{"walgit_scrub_healthy", "gauge", "Whether the latest configured durability scrub succeeded."},
+		{"walgit_scrub_runs_total", "counter", "Completed dual-authority scrub attempts."},
+		{"walgit_scrub_failures_total", "counter", "Failed dual-authority scrub attempts."},
+		{"walgit_scrub_seconds_total", "counter", "Time spent performing dual-authority scrubs."},
+		{"walgit_scrub_last_run_timestamp_seconds", "gauge", "Unix timestamp of the last dual-authority scrub attempt."},
+		{"walgit_scrub_last_success_timestamp_seconds", "gauge", "Unix timestamp of the last successful dual-authority scrub."},
+		{"walgit_scrub_generation", "gauge", "Generation verified by the last successful dual-authority scrub."},
 		{"walgit_last_activity_timestamp_seconds", "gauge", "Unix timestamp of the last authorized Git request."},
 	} {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n", metric.name, metric.help, metric.name, metric.kind)
 	}
+}
+
+func boolMetric(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func timestampMetric(value time.Time) float64 {
+	if value.IsZero() {
+		return 0
+	}
+	return float64(value.UnixNano()) / float64(time.Second)
 }
 
 func splitMetricKey(key string) [3]string {

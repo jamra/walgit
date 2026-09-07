@@ -109,6 +109,23 @@ For S3, repair additionally requires the dedicated
 in the [runbook](docs/scrub-repair.md). Stop the repository writer throughout
 repair.
 
+Strict dual-authority S3 also requires an explicit retention window and checks
+that both buckets have versioning and a sufficient Object Lock default. It adds
+the configured retention directly to immutable certificate and blob writes:
+
+```sh
+export WALGIT_MIN_RETENTION=720h
+export WALGIT_RETENTION_MODE=compliance
+walgit retention-check \
+  -store s3://independent-a/repositories \
+  -minimum 720h \
+  -mode compliance
+```
+
+See the [retention policy](docs/retention.md). The explicit
+`WALGIT_ALLOW_UNPROTECTED_S3=true` escape hatch is for benchmarks only and
+invalidates provider-loss durability claims.
+
 ## S3-compatible storage
 
 Use an `s3://bucket/prefix` store URI. Credentials and region use the standard
@@ -130,9 +147,12 @@ export WALGIT_S3_PATH_STYLE=true
 ```
 
 The bucket identity needs `GetObject`, `PutObject`, `HeadObject`,
-`ListBucket`, and `DeleteObject` for the configured prefix. S3 conditional
-writes must be supported; a losing manifest writer receives a precondition
-failure, reloads the winner, and retries against the new ETag.
+`ListBucket`, and `DeleteObject` for the configured prefix. Strict retention
+checks additionally need `GetBucketVersioning` and
+`GetObjectLockConfiguration`, and immutable uploads must be allowed to set
+Object Lock retention. S3 conditional writes must be supported; a losing
+manifest writer receives a precondition failure, reloads the winner, and
+retries against the new ETag.
 
 Small WAL transactions and checkpoints are generated directly into a bounded
 stream while their SHA-256 digest is calculated from the same bytes. Object
@@ -191,6 +211,8 @@ export WALGIT_BLOB_SECONDARY_STORE=s3://independent-account/walgit
 export WALGIT_REQUIRE_DUAL_AUTHORITY=true
 export WALGIT_S3_DISABLE_CONDITIONAL_WRITES=true
 export WALGIT_WRITER_SOCKET=/run/walgit/origin.sock
+export WALGIT_MIN_RETENTION=720h
+export WALGIT_RETENTION_MODE=compliance
 ```
 
 Dual-authority mode forces every transaction—including small and metadata-only
@@ -383,6 +405,7 @@ One process can route independent repositories using a JSON configuration:
       "repository": "caches/frontend.git",
       "store": "s3://company-git/walgit",
       "maintenance_interval": "5m",
+      "scrub_interval": "5m",
       "compact_after_entries": 100,
       "compact_after_bytes": 1073741824,
       "gc_grace": "24h",
@@ -517,9 +540,12 @@ replayable data and hash-chained ordering in both authorities and can recover
 after complete primary-manifest/WAL/blob loss. `walgit scrub` now verifies both
 complete copies, and `walgit repair` restores a damaged peer from an explicitly
 selected healthy source using a separately credentialed, audited path. The
-remaining operational gap is independently enforced retention or Object Lock
-and automatic scheduling/alerting. Without those controls, undetected deletion
-on one authority followed by loss of the other can still defeat the guarantee.
+server can schedule scrubs, stop writes and maintenance on failure, fail
+readiness, and expose alertable metrics. Strict S3 validates retention and adds
+explicit Object Lock retention to immutable writes. Operators must still use
+independently administered accounts, connect the metrics to alerting, and run
+disaster-restore drills. Without those controls, undetected deletion on one
+authority followed by loss of the other can still defeat the guarantee.
 Ordinary provider replication, versioning, or RAID alone must not be described
 as equivalent.
 There is no built-in service discovery, rendezvous-hash router, gossip, or
