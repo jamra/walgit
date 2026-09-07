@@ -46,12 +46,14 @@ type S3Store struct {
 	cachedManifest      *Manifest
 	cachedETag          string
 	blobs               blobStore
+	certificates        certificateStore
 }
 
 type stagedS3Transaction struct {
 	digest       string
 	bytes        int64
 	payloadBytes int64
+	descriptor   *ChunkRef
 }
 
 type streamedArchiveResult struct {
@@ -175,11 +177,16 @@ func OpenS3(location string) (Backend, error) {
 	if err != nil {
 		return nil, err
 	}
-	blobs, err := configureBlobReplication(store.blobStorage(), location)
+	primary := s3BlobStore{store: store}
+	blobs, certificates, err := configureDurability(primary, location)
 	if err != nil {
 		return nil, err
 	}
+	if certificates != nil && !store.unconditionalWrites {
+		return nil, errors.New("dual-authority certificates require WALGIT_S3_DISABLE_CONDITIONAL_WRITES=true and one repository writer")
+	}
 	store.blobs = blobs
+	store.certificates = certificates
 	return store, nil
 }
 
@@ -251,39 +258,31 @@ func (s *S3Store) Initialize(repoID, head, objectFormat string) error {
 	if objectFormat != "sha1" && objectFormat != "sha256" {
 		return fmt.Errorf("unsupported object format %q", objectFormat)
 	}
-	m := Manifest{Version: manifestVersion, Head: head, ObjectFormat: objectFormat, Refs: map[string]string{}}
-	if s.unconditionalWrites {
-		existing, err := s.Load(repoID)
-		if err == nil {
-			if existing.ObjectFormat != objectFormat || existing.Head != head {
-				return fmt.Errorf("existing S3 manifest configuration does not match repository")
-			}
-			return nil
+	existing, etag, err := s.loadPrimaryWithETag(repoID)
+	if err == nil {
+		if existing.ObjectFormat != objectFormat || existing.Head != head {
+			return fmt.Errorf("existing S3 manifest configuration does not match repository")
 		}
-		if !isNotFound(err) {
+		anchored, err := publishAnchor(s.certificates, repoID, existing)
+		if err != nil {
 			return err
 		}
+		if anchored.CertificateSHA256 == existing.CertificateSHA256 {
+			return nil
+		}
+		return s.putManifest(repoID, anchored, etag, false)
 	}
-	data, err := marshalManifest(m)
+	if !isNotFound(err) {
+		return err
+	}
+	m := Manifest{Version: manifestVersion, Head: head, ObjectFormat: objectFormat, Refs: map[string]string{}}
+	m, err = publishAnchor(s.certificates, repoID, m)
 	if err != nil {
 		return err
 	}
-	ctx, cancel := s.context()
-	defer cancel()
-	input := &s3.PutObjectInput{
-		Bucket: aws.String(s.bucket), Key: aws.String(s.key(repoID, "manifest.json")),
-		Body: strings.NewReader(string(data)), ContentLength: aws.Int64(int64(len(data))),
-		ContentType: aws.String("application/json"),
-	}
-	if !s.unconditionalWrites {
-		input.IfNoneMatch = aws.String("*")
-	}
-	_, err = s.client.PutObject(ctx, input)
-	if s.unconditionalWrites {
-		return err
-	}
+	err = s.putManifest(repoID, m, "", true)
 	if isPrecondition(err) {
-		existing, loadErr := s.Load(repoID)
+		existing, _, loadErr := s.loadPrimaryWithETag(repoID)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -303,17 +302,24 @@ func (s *S3Store) Stage(repoID, objectDir string, updates []RefUpdate) error {
 	if err != nil {
 		return err
 	}
-	objects, err := maybeStoreObjectBlobs(objectDir, s.blobStorage())
+	var objects []ObjectBlob
+	if s.certificates != nil {
+		objects, err = storeObjectBlobs(objectDir, s.blobStorage())
+	} else {
+		objects, err = maybeStoreObjectBlobs(objectDir, s.blobStorage())
+	}
 	if err != nil {
 		return err
 	}
 	meta := EntryMeta{TransactionID: txID, CreatedAt: time.Now().UTC(), Updates: updates, Objects: objects}
-	if len(objects) > 0 {
+	if len(objects) > 0 || s.certificates != nil {
 		meta, err = externalizeEntryMeta(meta, s.blobStorage())
 		if err != nil {
 			return err
 		}
 	}
+	usedDescriptor := meta.Descriptor
+	payloadBytes := objectBlobBytes(objects)
 	object, err := s.putStreamedObject(repoID, "transactions/"+txID+".wal", func(w io.Writer) error {
 		return writeArchive(w, meta, objectDir)
 	}, func(r io.Reader) error {
@@ -321,6 +327,7 @@ func (s *S3Store) Stage(repoID, objectDir string, updates []RefUpdate) error {
 		if validateErr != nil {
 			return validateErr
 		}
+		usedDescriptor = recovered.Descriptor
 		recovered, validateErr = resolveEntryMeta(recovered, s.blobStorage())
 		if validateErr != nil {
 			return validateErr
@@ -328,12 +335,14 @@ func (s *S3Store) Stage(repoID, objectDir string, updates []RefUpdate) error {
 		if recovered.TransactionID != txID {
 			return fmt.Errorf("transaction mismatch: got %s, want %s", recovered.TransactionID, txID)
 		}
+		payloadBytes = objectBlobBytes(recovered.Objects)
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	object.payloadBytes = objectBlobBytes(objects)
+	object.payloadBytes = payloadBytes
+	object.descriptor = usedDescriptor
 	s.stateMu.Lock()
 	if s.staged == nil {
 		s.staged = make(map[string]stagedS3Transaction)
@@ -378,12 +387,14 @@ func (s *S3Store) CommitBatch(repoID string, batches [][]RefUpdate) ([]ManifestE
 			continue
 		}
 		var recovered EntryMeta
+		var descriptor *ChunkRef
 		object, err := s.inspectStreamedObject(repoID, staged[i].file, func(r io.Reader) error {
 			var validateErr error
 			recovered, validateErr = readEntryArchiveMeta(r)
 			if validateErr != nil {
 				return validateErr
 			}
+			descriptor = recovered.Descriptor
 			recovered, validateErr = resolveEntryMeta(recovered, s.blobStorage())
 			if validateErr != nil {
 				return validateErr
@@ -398,6 +409,7 @@ func (s *S3Store) CommitBatch(repoID string, batches [][]RefUpdate) ([]ManifestE
 		}
 		staged[i].object = object
 		staged[i].object.payloadBytes = objectBlobBytes(recovered.Objects)
+		staged[i].object.descriptor = descriptor
 		if staged[i].object.digest == "" {
 			return nil, Manifest{}, errors.New("staged transaction is missing its SHA-256 metadata")
 		}
@@ -415,7 +427,9 @@ func (s *S3Store) CommitBatch(repoID string, batches [][]RefUpdate) ([]ManifestE
 				return nil, Manifest{}, err
 			}
 		}
+		previous := cloneManifest(m)
 		entries := make([]ManifestEntry, len(staged))
+		var certified []CertificateEntry
 		changed := false
 		for batchIndex, batch := range staged {
 			if updatesAlreadyApplied(m, batch.updates) {
@@ -439,6 +453,7 @@ func (s *S3Store) CommitBatch(repoID string, batches [][]RefUpdate) ([]ManifestE
 			entry := ManifestEntry{
 				Generation: generation, TransactionID: batch.txID, File: batch.file,
 				SHA256: batch.object.digest, Bytes: batch.object.bytes, PayloadBytes: batch.object.payloadBytes,
+				Descriptor: batch.object.descriptor,
 			}
 			for _, update := range batch.updates {
 				if isZeroOID(update.New) {
@@ -458,6 +473,7 @@ func (s *S3Store) CommitBatch(repoID string, batches [][]RefUpdate) ([]ManifestE
 				}
 			}
 			entries[batchIndex] = entry
+			certified = append(certified, CertificateEntry{Entry: entry, Updates: batch.updates})
 			changed = true
 		}
 		if !changed {
@@ -467,6 +483,10 @@ func (s *S3Store) CommitBatch(repoID string, batches [][]RefUpdate) ([]ManifestE
 				s.cachedETag = etag
 			}
 			return entries, cloneManifest(m), nil
+		}
+		m, err = publishTransition(s.certificates, repoID, previous, m, certified)
+		if err != nil {
+			return nil, Manifest{}, err
 		}
 		if err := s.putManifest(repoID, m, etag, false); isPrecondition(err) || isConflict(err) {
 			s.cachedManifest = nil
@@ -524,7 +544,7 @@ func (s *S3Store) Abort(repoID string, updates []RefUpdate) error {
 	}
 	rollbackID := "rollback-" + txID
 	transactionFile := "transactions/" + rollbackID + ".wal"
-	var rollbackHead *s3.HeadObjectOutput
+	var rollbackObject *stagedS3Transaction
 	for attempt := 0; attempt < 32; attempt++ {
 		m, etag, err := s.loadWithETag(repoID)
 		if err != nil {
@@ -545,17 +565,18 @@ func (s *S3Store) Abort(repoID string, updates []RefUpdate) error {
 		if !after {
 			return fmt.Errorf("cannot roll back prepared transaction %s because a touched ref advanced", txID)
 		}
+		previous := cloneManifest(m)
 		inverse := invertUpdates(updates)
-		if rollbackHead == nil {
-			rollbackHead, err = s.putMetadataTransaction(repoID, transactionFile, EntryMeta{
+		if rollbackObject == nil {
+			object, writeErr := s.putMetadataTransaction(repoID, transactionFile, EntryMeta{
 				TransactionID: rollbackID, CreatedAt: time.Now().UTC(), Updates: inverse,
 			})
-			if err != nil {
-				return err
+			if writeErr != nil {
+				return writeErr
 			}
+			rollbackObject = &object
 		}
-		digest := rollbackHead.Metadata["walgit-sha256"]
-		if digest == "" {
+		if rollbackObject.digest == "" {
 			return errors.New("rollback transaction is missing its SHA-256 metadata")
 		}
 		generation := m.Generation + 1
@@ -567,11 +588,16 @@ func (s *S3Store) Abort(repoID string, updates []RefUpdate) error {
 			}
 		}
 		m.Generation = generation
-		m.Entries = append(m.Entries, ManifestEntry{
+		entry := ManifestEntry{
 			Generation: generation, TransactionID: rollbackID, File: transactionFile,
-			SHA256: digest, Bytes: aws.ToInt64(rollbackHead.ContentLength),
-		})
+			SHA256: rollbackObject.digest, Bytes: rollbackObject.bytes, Descriptor: rollbackObject.descriptor,
+		}
+		m.Entries = append(m.Entries, entry)
 		delete(m.Prepared, txID)
+		m, err = publishTransition(s.certificates, repoID, previous, m, []CertificateEntry{{Entry: entry, Updates: inverse}})
+		if err != nil {
+			return err
+		}
 		if err := s.putManifest(repoID, m, etag, false); isPrecondition(err) || isConflict(err) {
 			continue
 		} else if err != nil {
@@ -617,16 +643,16 @@ func (s *S3Store) abortCoordinated(repoID string, updates []RefUpdate) error {
 	if !after {
 		return fmt.Errorf("cannot roll back transaction %s because a touched ref advanced", txID)
 	}
+	previous := cloneManifest(m)
 	inverse := invertUpdates(updates)
 	transactionFile := "transactions/" + rollbackID + ".wal"
-	head, err := s.putMetadataTransaction(repoID, transactionFile, EntryMeta{
+	object, err := s.putMetadataTransaction(repoID, transactionFile, EntryMeta{
 		TransactionID: rollbackID, CreatedAt: time.Now().UTC(), Updates: inverse,
 	})
 	if err != nil {
 		return err
 	}
-	digest := head.Metadata["walgit-sha256"]
-	if digest == "" {
+	if object.digest == "" {
 		return errors.New("rollback transaction is missing its SHA-256 metadata")
 	}
 	generation := m.Generation + 1
@@ -638,11 +664,16 @@ func (s *S3Store) abortCoordinated(repoID string, updates []RefUpdate) error {
 		}
 	}
 	m.Generation = generation
-	m.Entries = append(m.Entries, ManifestEntry{
+	entry := ManifestEntry{
 		Generation: generation, TransactionID: rollbackID, File: transactionFile,
-		SHA256: digest, Bytes: aws.ToInt64(head.ContentLength),
-	})
+		SHA256: object.digest, Bytes: object.bytes, Descriptor: object.descriptor,
+	}
+	m.Entries = append(m.Entries, entry)
 	delete(m.Prepared, txID)
+	m, err = publishTransition(s.certificates, repoID, previous, m, []CertificateEntry{{Entry: entry, Updates: inverse}})
+	if err != nil {
+		return err
+	}
 	if err := s.putManifest(repoID, m, etag, false); err != nil {
 		return err
 	}
@@ -652,19 +683,37 @@ func (s *S3Store) abortCoordinated(repoID string, updates []RefUpdate) error {
 	return nil
 }
 
-func (s *S3Store) putMetadataTransaction(repoID, transactionFile string, meta EntryMeta) (*s3.HeadObjectOutput, error) {
+func (s *S3Store) putMetadataTransaction(repoID, transactionFile string, meta EntryMeta) (stagedS3Transaction, error) {
+	var err error
+	if s.certificates != nil {
+		meta, err = externalizeEntryMeta(meta, s.blobStorage())
+		if err != nil {
+			return stagedS3Transaction{}, err
+		}
+	}
+	usedDescriptor := meta.Descriptor
 	object, err := s.putStreamedObject(repoID, transactionFile, func(w io.Writer) error {
 		return writeMetadataArchive(w, meta)
 	}, func(r io.Reader) error {
-		return validateEntryArchive(r, meta.TransactionID)
+		recovered, validateErr := readEntryArchiveMeta(r)
+		if validateErr != nil {
+			return validateErr
+		}
+		usedDescriptor = recovered.Descriptor
+		recovered, validateErr = resolveEntryMeta(recovered, s.blobStorage())
+		if validateErr != nil {
+			return validateErr
+		}
+		if recovered.TransactionID != meta.TransactionID {
+			return fmt.Errorf("transaction mismatch: got %s, want %s", recovered.TransactionID, meta.TransactionID)
+		}
+		return nil
 	})
 	if err != nil {
-		return nil, err
+		return stagedS3Transaction{}, err
 	}
-	return &s3.HeadObjectOutput{
-		ContentLength: aws.Int64(object.bytes),
-		Metadata:      map[string]string{"walgit-sha256": object.digest},
-	}, nil
+	object.descriptor = usedDescriptor
+	return object, nil
 }
 
 func (s *S3Store) Load(repoID string) (Manifest, error) {
@@ -676,7 +725,17 @@ func (s *S3Store) Load(repoID string) (Manifest, error) {
 		}
 		m, etag, err := s.loadWithETag(repoID)
 		if err != nil {
-			return Manifest{}, err
+			if s.certificates == nil {
+				return Manifest{}, err
+			}
+			m, _, err = s.certificates.Recover(repoID)
+			if err != nil {
+				return Manifest{}, fmt.Errorf("primary manifest unavailable and certificate recovery failed: %w", err)
+			}
+			// Recovery from certificates is sufficient for reads and restore,
+			// but it is not a writable primary. Do not cache it as coordinator
+			// state or a later commit could bypass primary repair.
+			return cloneManifest(m), nil
 		}
 		cached := cloneManifest(m)
 		s.cachedManifest = &cached
@@ -684,7 +743,14 @@ func (s *S3Store) Load(repoID string) (Manifest, error) {
 		return cloneManifest(m), nil
 	}
 	m, _, err := s.loadWithETag(repoID)
-	return m, err
+	if err == nil || s.certificates == nil {
+		return m, err
+	}
+	recovered, _, certificateErr := s.certificates.Recover(repoID)
+	if certificateErr != nil {
+		return Manifest{}, fmt.Errorf("primary manifest unavailable and certificate recovery failed: %w", certificateErr)
+	}
+	return recovered, nil
 }
 
 func (s *S3Store) ReplayFrom(repoID string, generation uint64, gitObjects string, apply func(ManifestEntry, EntryMeta) error) (Manifest, error) {
@@ -699,8 +765,21 @@ func (s *S3Store) ReplayManifest(repoID string, generation uint64, m Manifest, g
 	if generation > m.Generation {
 		return Manifest{}, fmt.Errorf("local generation %d is ahead of manifest generation %d", generation, m.Generation)
 	}
+	if generation < m.CertificateFloor {
+		return Manifest{}, fmt.Errorf("local generation %d predates recoverable certificate floor %d", generation, m.CertificateFloor)
+	}
 	for _, entry := range m.Entries {
 		if entry.Generation <= generation {
+			continue
+		}
+		if entry.Descriptor != nil {
+			meta, err := replayEntryDescriptor(entry, gitObjects, s.blobStorage())
+			if err != nil {
+				return Manifest{}, fmt.Errorf("replay descriptor for generation %d: %w", entry.Generation, err)
+			}
+			if err := apply(entry, meta); err != nil {
+				return Manifest{}, fmt.Errorf("apply %s: %w", entry.File, err)
+			}
 			continue
 		}
 		body, err := s.get(repoID, entry.File)
@@ -879,6 +958,27 @@ func (s *S3Store) GarbageCollect(repoID string, olderThan time.Time) (GCResult, 
 }
 
 func (s *S3Store) loadWithETag(repoID string) (Manifest, string, error) {
+	m, etag, err := s.loadPrimaryWithETag(repoID)
+	if err != nil || s.certificates == nil {
+		return m, etag, err
+	}
+	recovered, _, err := s.certificates.Recover(repoID)
+	if err != nil {
+		return Manifest{}, "", fmt.Errorf("validate dual-authority certificate chain: %w", err)
+	}
+	if recovered.Generation > m.Generation {
+		return recovered, etag, nil
+	}
+	if recovered.Generation < m.Generation {
+		return Manifest{}, "", errors.New("primary manifest is ahead of the dual-authority certificate chain")
+	}
+	if m.CertificateSHA256 != recovered.CertificateSHA256 {
+		return Manifest{}, "", errors.New("primary manifest and dual-authority certificate chain disagree")
+	}
+	return m, etag, nil
+}
+
+func (s *S3Store) loadPrimaryWithETag(repoID string) (Manifest, string, error) {
 	ctx, cancel := s.context()
 	defer cancel()
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{

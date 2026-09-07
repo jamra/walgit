@@ -88,6 +88,43 @@ cache, to safely recover a staged transaction. Replay always recalculates and
 checks the manifest digest before applying reference updates. Inline archives
 created before the blob format remain readable.
 
+### Dual-authority certificates
+
+With `WALGIT_REQUIRE_DUAL_AUTHORITY=true`, the durable commit path is:
+
+```text
+all chunks + transaction descriptor
+        │
+        ├──────────────► authority A (verified)
+        └──────────────► authority B (verified)
+                              │
+previous certificate hash + entries + resulting refs
+        │
+        ├──────────────► authority A (immutable certificate)
+        └──────────────► authority B (immutable certificate)
+                              │
+                              ▼
+                     primary manifest cache
+                              │
+                              ▼
+                       acknowledge Git
+```
+
+Every transaction is externalized in this mode, including small pushes and
+metadata-only rollback records. A certificate is a SHA-256-addressed immutable
+link containing the prior certificate hash, consecutive generation entries,
+their descriptor hashes and ref updates, and the resulting complete ref map.
+The immediate parent is re-read and verified on each authority before a child
+is stored. Both child writes must verify before primary-manifest publication.
+
+The primary manifest can be reconstructed from the chain. Replay uses certified
+descriptors when primary WAL objects are unavailable. When both authorities are
+readable, only their highest common valid chain is accepted; when one has been
+lost, the survivor's fully validated chain is recoverable. S3 uses one
+repository-scoped writer because two object stores cannot perform one atomic
+cross-provider CAS. Full rules and the unavoidable unknown-outcome-tail case are
+documented in [the certificate protocol](certificates.md).
+
 ### Serving caches
 
 Git repositories on serving nodes are reconstructible caches, not authority.
@@ -113,6 +150,11 @@ plus WAL rather than attempting an in-place repair.
 | One blob authority rejects or loses a write | Push fails before WAL publication |
 | Primary blob copy is missing or corrupt | Verified secondary copy is used |
 | Both blob copies are missing or corrupt | Replay fails closed; refs do not advance |
+| One certificate write fails | Push fails; highest common chain does not advance |
+| Both certificates succeed but manifest publication is lost | Retry recovers the certified commit; client had an unknown outcome |
+| Primary manifest, WAL, and blobs are lost | Survivor certificate chain and descriptors reconstruct the repository |
+| Certificate chains disagree while both are readable | Only their highest common valid chain is selected |
+| A certificate chain is corrupt on both sides | Recovery fails closed |
 | Checksum or archive validation fails | No manifest publication or acknowledgement |
 | Manifest CAS loses a race | Reload winner and retry against its ETag |
 | Filesystem sync reports an error | Entire store is poisoned; no retry in that process |
@@ -121,37 +163,35 @@ plus WAL rather than attempting an in-place repair.
 
 ## Strict no-loss deployment
 
-The current code protects against process crashes, torn publication, detected
-filesystem writeback failures, corrupt transfers, and loss of a serving cache.
-It can also require the large-object data plane to reach two blob authorities.
-A single primary S3 bucket still owns the manifest and WAL stub, however, so
-the implementation cannot yet satisfy a requirement that acknowledged history
-survive complete loss or hostile deletion of that provider account or region.
+The code now enforces the foreground half of the stronger policy for
+repositories initialized with dual-authority mode:
 
-The completed part of the stronger policy is:
+1. Store every transaction's chunks and descriptor in two authorities.
+2. Validate immutable existing objects and fall back to a verified secondary.
+3. Store a hash-chained commit certificate in both authorities before success.
+4. Reject one-sided writes and select only the common chain while both sides are
+   readable.
+5. Reconstruct refs, ordering, and objects from one surviving authority after
+   complete primary manifest/WAL/blob loss.
+6. Preserve abort semantics with a certified compensation entry.
 
-1. Split large files into content-addressed immutable chunks.
-2. Store every chunk and its external transaction descriptor in two configured
-   authorities concurrently.
-3. Validate existing objects and fall back to a verified secondary on reads.
-4. Refuse publication after any one-sided foreground write.
+This means loss of one complete authority does not lose an acknowledged commit,
+provided the other still retains its acknowledged objects. Two copies alone do
+not make that statement timeless. The remaining operational protocol is:
 
-The remaining dual-authority commit protocol is:
-
-1. Publish an immutable, hash-chained commit certificate containing the
-   generation, previous certificate hash, transaction descriptor hash, and
-   resulting refs.
-2. Store and validate that certificate in both authorities.
-3. Acknowledge Git only after both authorities contain the data and certificate.
-4. Elect/recover the current head from the certificate chain without depending
-   on the lost primary manifest.
-5. Treat a one-sided write as unacknowledged but repairable. A privileged repair
-   worker copies and verifies the missing side without changing content or
-   generation.
-6. Enable versioning and retention/Object Lock independently on both sides,
+1. Enable versioning and retention/Object Lock independently on both sides,
    using credentials that cannot shorten retention or delete retained data.
-7. Continuously scrub both copies against the certificate chain and exercise
-   restoration in a separate account.
+2. Continuously scrub both copies against the certificate chain.
+3. Use a separately privileged repair worker to copy and verify missing chunks,
+   descriptors, and certificate links before another failure can overlap.
+4. Exercise restoration in a separate account and run `git fsck --strict`.
+5. Add a certified checkpoint migration before claiming full-history protection
+   for a repository anchored above generation zero.
+
+If one authority disappears, a survivor-only tail could be an unacknowledged
+write whose peer failed just before success. Recovering it avoids acknowledged
+data loss but can expose an extra unknown-outcome commit. Avoiding both outcomes
+requires a third witness or consensus quorum; see the protocol document.
 
 Ordinary same-provider replication, RAID, snapshots controlled by the same
 credentials, or a successful local `fsync` are useful layers, but they are not

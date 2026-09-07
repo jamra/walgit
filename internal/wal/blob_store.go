@@ -521,14 +521,27 @@ func resolveEntryMeta(meta EntryMeta, storage blobStore) (EntryMeta, error) {
 	if resolved.Descriptor != nil {
 		return EntryMeta{}, errors.New("transaction descriptor cannot reference another descriptor")
 	}
-	resolvedID, err := transactionID(resolved.Updates)
-	if err != nil {
-		return EntryMeta{}, err
-	}
-	if resolved.TransactionID != meta.TransactionID || resolvedID != meta.TransactionID {
+	if resolved.TransactionID != meta.TransactionID || !transactionIdentityMatches(resolved.TransactionID, resolved.Updates) {
 		return EntryMeta{}, fmt.Errorf("transaction descriptor mismatch for %s", meta.TransactionID)
 	}
 	return resolved, nil
+}
+
+func replayEntryDescriptor(entry ManifestEntry, objectDir string, storage blobStore) (EntryMeta, error) {
+	if entry.Descriptor == nil {
+		return EntryMeta{}, errors.New("manifest entry has no external descriptor")
+	}
+	meta, err := resolveEntryMeta(EntryMeta{TransactionID: entry.TransactionID, Descriptor: entry.Descriptor}, storage)
+	if err != nil {
+		return EntryMeta{}, err
+	}
+	if meta.TransactionID != entry.TransactionID {
+		return EntryMeta{}, fmt.Errorf("transaction descriptor mismatch for %s", entry.TransactionID)
+	}
+	if err := restoreObjectBlobs(meta.Objects, objectDir, storage); err != nil {
+		return EntryMeta{}, err
+	}
+	return meta, nil
 }
 
 func externalizeCheckpointMeta(meta CheckpointMeta, storage blobStore) (CheckpointMeta, error) {

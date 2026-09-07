@@ -38,6 +38,11 @@ type ManifestReplayer interface {
 	ReplayManifest(repoID string, generation uint64, manifest Manifest, gitObjects string, apply func(ManifestEntry, EntryMeta) error) (Manifest, error)
 }
 
+type durableAuthority interface {
+	blobStore
+	certificateAuthority
+}
+
 func Open(location string) (Backend, error) {
 	if location == "" {
 		return nil, fmt.Errorf("storage location is required")
@@ -60,33 +65,40 @@ func Open(location string) (Backend, error) {
 		return nil, err
 	}
 	store := Store{Root: root}
-	blobs, err := configureBlobReplication(store.blobStorage(), location)
+	blobs, certificates, err := configureDurability(filesystemBlobStore{store: store}, location)
 	if err != nil {
 		return nil, err
 	}
 	store.blobs = blobs
+	store.certificates = certificates
 	return store, nil
 }
 
-func configureBlobReplication(primary blobStore, primaryLocation string) (blobStore, error) {
+func configureDurability(primary durableAuthority, primaryLocation string) (blobStore, certificateStore, error) {
 	secondaryLocation := strings.TrimSpace(os.Getenv("WALGIT_BLOB_SECONDARY_STORE"))
-	required, _ := strconv.ParseBool(os.Getenv("WALGIT_REQUIRE_BLOB_REPLICATION"))
+	requireBlobs, _ := strconv.ParseBool(os.Getenv("WALGIT_REQUIRE_BLOB_REPLICATION"))
+	requireCertificates, _ := strconv.ParseBool(os.Getenv("WALGIT_REQUIRE_DUAL_AUTHORITY"))
 	if secondaryLocation == "" {
-		if required {
-			return nil, errors.New("WALGIT_REQUIRE_BLOB_REPLICATION is enabled but WALGIT_BLOB_SECONDARY_STORE is empty")
+		if requireBlobs || requireCertificates {
+			return nil, nil, errors.New("dual storage is required but WALGIT_BLOB_SECONDARY_STORE is empty")
 		}
-		return primary, nil
+		return primary, nil, nil
 	}
 	primaryIdentity, primaryErr := normalizeBlobLocation(primaryLocation)
 	secondaryIdentity, secondaryErr := normalizeBlobLocation(secondaryLocation)
 	if primaryErr == nil && secondaryErr == nil && primaryIdentity == secondaryIdentity {
-		return nil, errors.New("primary and secondary blob stores must be different locations")
+		return nil, nil, errors.New("primary and secondary stores must be different locations")
 	}
-	secondary, err := openSecondaryBlobStore(secondaryLocation)
+	secondary, err := openSecondaryAuthority(secondaryLocation)
 	if err != nil {
-		return nil, fmt.Errorf("open secondary blob store: %w", err)
+		return nil, nil, fmt.Errorf("open secondary store: %w", err)
 	}
-	return replicatedBlobStore{stores: []blobStore{primary, secondary}}, nil
+	blobs := replicatedBlobStore{stores: []blobStore{primary, secondary}}
+	if !requireCertificates {
+		return blobs, nil, nil
+	}
+	certificates := replicatedCertificateStore{authorities: []certificateAuthority{primary, secondary}}
+	return blobs, certificates, nil
 }
 
 func normalizeBlobLocation(location string) (string, error) {
@@ -103,7 +115,7 @@ func normalizeBlobLocation(location string) (string, error) {
 	return filepath.Abs(location)
 }
 
-func openSecondaryBlobStore(location string) (blobStore, error) {
+func openSecondaryAuthority(location string) (durableAuthority, error) {
 	if strings.HasPrefix(location, "s3://") {
 		store, err := openS3Single(location, true)
 		if err != nil {

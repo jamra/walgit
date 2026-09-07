@@ -35,12 +35,13 @@ type EntryMeta struct {
 }
 
 type ManifestEntry struct {
-	Generation    uint64 `json:"generation"`
-	TransactionID string `json:"transaction_id"`
-	File          string `json:"file"`
-	SHA256        string `json:"sha256"`
-	Bytes         int64  `json:"bytes"`
-	PayloadBytes  int64  `json:"payload_bytes,omitempty"`
+	Generation    uint64    `json:"generation"`
+	TransactionID string    `json:"transaction_id"`
+	File          string    `json:"file"`
+	SHA256        string    `json:"sha256"`
+	Bytes         int64     `json:"bytes"`
+	PayloadBytes  int64     `json:"payload_bytes,omitempty"`
+	Descriptor    *ChunkRef `json:"descriptor,omitempty"`
 }
 
 type Checkpoint struct {
@@ -69,20 +70,23 @@ type PreparedTransaction struct {
 }
 
 type Manifest struct {
-	Version      int                            `json:"version"`
-	Generation   uint64                         `json:"generation"`
-	Head         string                         `json:"head"`
-	ObjectFormat string                         `json:"object_format"`
-	Refs         map[string]string              `json:"refs"`
-	Entries      []ManifestEntry                `json:"entries"`
-	Checkpoint   *Checkpoint                    `json:"checkpoint,omitempty"`
-	Prepared     map[string]PreparedTransaction `json:"prepared,omitempty"`
+	Version           int                            `json:"version"`
+	Generation        uint64                         `json:"generation"`
+	Head              string                         `json:"head"`
+	ObjectFormat      string                         `json:"object_format"`
+	Refs              map[string]string              `json:"refs"`
+	Entries           []ManifestEntry                `json:"entries"`
+	Checkpoint        *Checkpoint                    `json:"checkpoint,omitempty"`
+	Prepared          map[string]PreparedTransaction `json:"prepared,omitempty"`
+	CertificateSHA256 string                         `json:"certificate_sha256,omitempty"`
+	CertificateFloor  uint64                         `json:"certificate_floor,omitempty"`
 }
 
 type Store struct {
-	Root   string
-	faults *storeFaults
-	blobs  blobStore
+	Root         string
+	faults       *storeFaults
+	blobs        blobStore
+	certificates certificateStore
 }
 
 type storeFaults struct {
@@ -141,14 +145,31 @@ func (s Store) Initialize(repoID, head, objectFormat string) error {
 		return err
 	}
 	return s.withLock(repoID, func() error {
-		_, err := os.Stat(filepath.Join(dir, "manifest.json"))
+		m, err := readManifest(dir)
 		if err == nil {
-			return nil
+			if m.Head != head || m.ObjectFormat != objectFormat {
+				return errors.New("existing manifest configuration does not match repository")
+			}
+			anchored, err := publishAnchor(s.certificates, repoID, m)
+			if err != nil {
+				return err
+			}
+			if anchored.CertificateSHA256 == m.CertificateSHA256 {
+				return nil
+			}
+			if err := s.writeManifest(dir, anchored); err != nil {
+				return err
+			}
+			return s.syncDirectory(dir, "initialize certificate anchor")
 		}
 		if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		m := Manifest{Version: manifestVersion, Head: head, ObjectFormat: objectFormat, Refs: map[string]string{}}
+		m = Manifest{Version: manifestVersion, Head: head, ObjectFormat: objectFormat, Refs: map[string]string{}}
+		m, err = publishAnchor(s.certificates, repoID, m)
+		if err != nil {
+			return err
+		}
 		if err := s.writeManifest(dir, m); err != nil {
 			return err
 		}
@@ -177,12 +198,17 @@ func (s Store) Stage(repoID, objectDir string, updates []RefUpdate) error {
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
-	objects, err := maybeStoreObjectBlobs(objectDir, s.blobStorage())
+	var objects []ObjectBlob
+	if s.certificates != nil {
+		objects, err = storeObjectBlobs(objectDir, s.blobStorage())
+	} else {
+		objects, err = maybeStoreObjectBlobs(objectDir, s.blobStorage())
+	}
 	if err != nil {
 		return err
 	}
 	meta := EntryMeta{TransactionID: txID, CreatedAt: time.Now().UTC(), Updates: updates, Objects: objects}
-	if len(objects) > 0 {
+	if len(objects) > 0 || s.certificates != nil {
 		meta, err = externalizeEntryMeta(meta, s.blobStorage())
 		if err != nil {
 			return err
@@ -220,10 +246,11 @@ func (s Store) Commit(repoID string, updates []RefUpdate) (ManifestEntry, Manife
 	var result Manifest
 	err = s.withLock(repoID, func() error {
 		dir := filepath.Join(s.Root, repoID)
-		m, err := readManifest(dir)
+		m, err := s.authoritativeManifest(repoID)
 		if err != nil {
 			return err
 		}
+		previous := cloneManifest(m)
 		if updatesAlreadyApplied(m, updates) {
 			committed = ManifestEntry{Generation: m.Generation, TransactionID: txID}
 			for i := len(m.Entries) - 1; i >= 0; i-- {
@@ -260,13 +287,13 @@ func (s Store) Commit(repoID string, updates []RefUpdate) (ManifestEntry, Manife
 		if err != nil {
 			return err
 		}
-		payloadBytes, err := archivePayloadBytes(finalPath, s.blobStorage())
+		payloadBytes, descriptor, err := archiveEntryDetails(finalPath, s.blobStorage())
 		if err != nil {
 			return err
 		}
 		entry := ManifestEntry{
 			Generation: generation, TransactionID: txID, File: name,
-			SHA256: digest, Bytes: size, PayloadBytes: payloadBytes,
+			SHA256: digest, Bytes: size, PayloadBytes: payloadBytes, Descriptor: descriptor,
 		}
 		for _, u := range updates {
 			if isZeroOID(u.New) {
@@ -281,6 +308,10 @@ func (s Store) Commit(repoID string, updates []RefUpdate) (ManifestEntry, Manife
 			m.Prepared = make(map[string]PreparedTransaction)
 		}
 		m.Prepared[txID] = PreparedTransaction{TransactionID: txID, Generation: generation, CreatedAt: time.Now().UTC(), Updates: updates}
+		m, err = publishTransition(s.certificates, repoID, previous, m, []CertificateEntry{{Entry: entry, Updates: updates}})
+		if err != nil {
+			return err
+		}
 		if err := s.writeManifest(dir, m); err != nil {
 			return err
 		}
@@ -300,7 +331,7 @@ func (s Store) Finalize(repoID string, updates []RefUpdate) error {
 	}
 	return s.withLock(repoID, func() error {
 		dir := filepath.Join(s.Root, repoID)
-		m, err := readManifest(dir)
+		m, err := s.authoritativeManifest(repoID)
 		if err != nil {
 			return err
 		}
@@ -329,24 +360,41 @@ func (s Store) Abort(repoID string, updates []RefUpdate) error {
 	return s.withLock(repoID, func() error {
 		dir := filepath.Join(s.Root, repoID)
 		defer os.Remove(filepath.Join(dir, "pending", txID+".wal")) //nolint:errcheck
-		m, err := readManifest(dir)
+		m, err := s.authoritativeManifest(repoID)
 		if err != nil {
 			return err
 		}
-		if _, ok := m.Prepared[txID]; !ok {
-			return nil
+		_, prepared := m.Prepared[txID]
+		if !prepared {
+			if s.certificates == nil {
+				return nil
+			}
+			found := false
+			for _, entry := range m.Entries {
+				if entry.TransactionID == txID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil
+			}
 		}
 		before, after := transactionState(m, updates)
 		if before {
-			delete(m.Prepared, txID)
-			if err := s.writeManifest(dir, m); err != nil {
-				return err
+			if prepared {
+				delete(m.Prepared, txID)
+				if err := s.writeManifest(dir, m); err != nil {
+					return err
+				}
+				return s.syncDirectory(dir, "sync aborted manifest directory")
 			}
-			return s.syncDirectory(dir, "sync aborted manifest directory")
+			return nil
 		}
 		if !after {
 			return fmt.Errorf("cannot roll back prepared transaction %s because a touched ref advanced", txID)
 		}
+		previous := cloneManifest(m)
 		inverse := invertUpdates(updates)
 		generation := m.Generation + 1
 		rollbackID := "rollback-" + txID
@@ -360,6 +408,13 @@ func (s Store) Abort(repoID string, updates []RefUpdate) error {
 			tmpName := tmp.Name()
 			defer os.Remove(tmpName)
 			meta := EntryMeta{TransactionID: rollbackID, CreatedAt: time.Now().UTC(), Updates: inverse}
+			if s.certificates != nil {
+				meta, err = externalizeEntryMeta(meta, s.blobStorage())
+				if err != nil {
+					tmp.Close()
+					return err
+				}
+			}
 			if err := writeMetadataArchive(&durabilityWriter{store: s, writer: tmp, operation: "write rollback WAL"}, meta); err != nil {
 				tmp.Close()
 				return err
@@ -384,6 +439,10 @@ func (s Store) Abort(repoID string, updates []RefUpdate) error {
 		if err != nil {
 			return err
 		}
+		_, descriptor, err := archiveEntryDetails(finalPath, s.blobStorage())
+		if err != nil {
+			return err
+		}
 		for _, update := range inverse {
 			if isZeroOID(update.New) {
 				delete(m.Refs, update.Ref)
@@ -392,10 +451,16 @@ func (s Store) Abort(repoID string, updates []RefUpdate) error {
 			}
 		}
 		m.Generation = generation
-		m.Entries = append(m.Entries, ManifestEntry{
+		entry := ManifestEntry{
 			Generation: generation, TransactionID: rollbackID, File: name, SHA256: digest, Bytes: size,
-		})
+			Descriptor: descriptor,
+		}
+		m.Entries = append(m.Entries, entry)
 		delete(m.Prepared, txID)
+		m, err = publishTransition(s.certificates, repoID, previous, m, []CertificateEntry{{Entry: entry, Updates: inverse}})
+		if err != nil {
+			return err
+		}
 		if err := s.writeManifest(dir, m); err != nil {
 			return err
 		}
@@ -413,7 +478,34 @@ func (s Store) Load(repoID string) (Manifest, error) {
 	if err := validateID(repoID); err != nil {
 		return Manifest{}, err
 	}
-	return readManifest(filepath.Join(s.Root, repoID))
+	return s.authoritativeManifest(repoID)
+}
+
+func (s Store) authoritativeManifest(repoID string) (Manifest, error) {
+	primary, primaryErr := readManifest(filepath.Join(s.Root, repoID))
+	if s.certificates == nil {
+		return primary, primaryErr
+	}
+	recovered, _, certificateErr := s.certificates.Recover(repoID)
+	if primaryErr != nil {
+		if certificateErr != nil {
+			return Manifest{}, fmt.Errorf("primary manifest unavailable and certificate recovery failed: %w", certificateErr)
+		}
+		return recovered, nil
+	}
+	if certificateErr != nil {
+		return Manifest{}, fmt.Errorf("validate dual-authority certificate chain: %w", certificateErr)
+	}
+	if recovered.Generation > primary.Generation {
+		return recovered, nil
+	}
+	if recovered.Generation < primary.Generation {
+		return Manifest{}, errors.New("primary manifest is ahead of the dual-authority certificate chain")
+	}
+	if primary.CertificateSHA256 != recovered.CertificateSHA256 {
+		return Manifest{}, errors.New("primary manifest and dual-authority certificate chain disagree")
+	}
+	return primary, nil
 }
 
 func (s Store) ReplayFrom(repoID string, generation uint64, gitObjects string, apply func(ManifestEntry, EntryMeta) error) (Manifest, error) {
@@ -424,8 +516,21 @@ func (s Store) ReplayFrom(repoID string, generation uint64, gitObjects string, a
 	if generation > m.Generation {
 		return Manifest{}, fmt.Errorf("local generation %d is ahead of manifest generation %d", generation, m.Generation)
 	}
+	if generation < m.CertificateFloor {
+		return Manifest{}, fmt.Errorf("local generation %d predates recoverable certificate floor %d", generation, m.CertificateFloor)
+	}
 	for _, entry := range m.Entries {
 		if entry.Generation <= generation {
+			continue
+		}
+		if entry.Descriptor != nil {
+			meta, err := replayEntryDescriptor(entry, gitObjects, s.blobStorage())
+			if err != nil {
+				return Manifest{}, fmt.Errorf("replay descriptor for generation %d: %w", entry.Generation, err)
+			}
+			if err := apply(entry, meta); err != nil {
+				return Manifest{}, fmt.Errorf("apply %s: %w", entry.File, err)
+			}
 			continue
 		}
 		path := filepath.Join(s.Root, repoID, entry.File)
@@ -524,7 +629,7 @@ func (s Store) CreateCheckpoint(repoID, gitObjects string, expectedGeneration ui
 		SHA256: digest, Bytes: size, PayloadBytes: objectBlobBytes(objects),
 	}
 	err = s.withLock(repoID, func() error {
-		latest, err := readManifest(dir)
+		latest, err := s.authoritativeManifest(repoID)
 		if err != nil {
 			return err
 		}
@@ -609,7 +714,7 @@ func (s Store) GarbageCollect(repoID string, olderThan time.Time) (GCResult, err
 	var result GCResult
 	err := s.withLock(repoID, func() error {
 		dir := filepath.Join(s.Root, repoID)
-		m, err := readManifest(dir)
+		m, err := s.authoritativeManifest(repoID)
 		if err != nil {
 			return err
 		}
@@ -1154,34 +1259,40 @@ func readEntryArchiveMeta(r io.Reader) (EntryMeta, error) {
 	return meta, nil
 }
 
-func archivePayloadBytes(path string, blobs blobStore) (int64, error) {
+func archiveEntryDetails(path string, blobs blobStore) (int64, *ChunkRef, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	defer file.Close()
 	tr := tar.NewReader(bufio.NewReader(file))
 	for {
 		header, err := tr.Next()
 		if errors.Is(err, io.EOF) {
-			return 0, errors.New("entry has no metadata")
+			return 0, nil, errors.New("entry has no metadata")
 		}
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 		if header.Name != "meta.json" {
 			continue
 		}
 		var meta EntryMeta
 		if err := json.NewDecoder(io.LimitReader(tr, header.Size)).Decode(&meta); err != nil {
-			return 0, err
+			return 0, nil, err
 		}
+		descriptor := meta.Descriptor
 		meta, err = resolveEntryMeta(meta, blobs)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
-		return objectBlobBytes(meta.Objects), nil
+		return objectBlobBytes(meta.Objects), descriptor, nil
 	}
+}
+
+func archivePayloadBytes(path string, blobs blobStore) (int64, error) {
+	payloadBytes, _, err := archiveEntryDetails(path, blobs)
+	return payloadBytes, err
 }
 
 func validateCheckpointArchive(r io.Reader, expectedGeneration uint64) error {
@@ -1310,6 +1421,21 @@ func transactionID(updates []RefUpdate) (string, error) {
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+func transactionIdentityMatches(identity string, updates []RefUpdate) bool {
+	digest, err := transactionID(updates)
+	if err != nil {
+		return false
+	}
+	if identity == digest {
+		return true
+	}
+	if !strings.HasPrefix(identity, "rollback-") {
+		return false
+	}
+	original, err := transactionID(invertUpdates(updates))
+	return err == nil && identity == "rollback-"+original
 }
 
 func cloneRefs(refs map[string]string) map[string]string {

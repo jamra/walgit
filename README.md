@@ -167,15 +167,42 @@ filesystem path or `file://` URI. A configured one-sided write fails the push;
 reads try the primary, verify the hash, and fall back to the secondary on a
 missing or corrupt chunk.
 
-This is deliberately only the dual-authority **blob data plane**. The current
-manifest and WAL stub remain in the primary store, so the option does not yet
-satisfy the stronger promise that an acknowledged repository survives total
-loss of the primary provider. That requires replicated, hash-chained commit
-certificates and a repair/scrub worker; see [the reliability model](docs/reliability.md).
-Blob garbage collection is also intentionally disabled until that worker can
-prove reachability and retention on both authorities. Use a separate store
-prefix per tenant or security domain; cross-tenant deduplication can leak
-whether content already exists.
+`WALGIT_REQUIRE_BLOB_REPLICATION` protects only the large-object data plane.
+For a repository initialized from generation zero, enable hash-chained commit
+certificates as well:
+
+```sh
+export WALGIT_BLOB_SECONDARY_STORE=s3://independent-account/walgit
+export WALGIT_REQUIRE_DUAL_AUTHORITY=true
+export WALGIT_S3_DISABLE_CONDITIONAL_WRITES=true
+export WALGIT_WRITER_SOCKET=/run/walgit/origin.sock
+```
+
+Dual-authority mode forces every transaction—including small and metadata-only
+rollbacks—through replicated content descriptors. Each commit certificate
+contains its generation, previous certificate hash, certified transaction
+entries, resulting refs, repository configuration, and descriptor hashes. The
+identical immutable certificate must reach both authorities before the primary
+manifest can publish and Git can receive success. Certificates live under
+`.walgit-certificates/<repo-id>/<generation>-<sha256>.cert`.
+
+The mutable manifest is then an acceleration cache rather than the only record
+of ordering. If it and the primary WAL namespace disappear, walgit rebuilds the
+manifest from the surviving validated certificate chain and replays objects
+directly from certified descriptors. When both authorities are readable, only
+their highest common valid chain is accepted, preventing a one-sided write from
+becoming authoritative. S3 certificate mode requires the included single
+repository writer because two unrelated object stores cannot atomically CAS one
+shared chain. See [the certificate protocol](docs/certificates.md) and
+[the reliability model](docs/reliability.md).
+
+Existing repositories receive an explicit legacy anchor at their current
+generation. Fresh disaster restore before that generation is refused because
+older objects were not retrospectively replicated; start new strict repositories
+in dual-authority mode or retain a verified migration checkpoint. Blob and
+certificate garbage collection remain disabled. Use a separate store prefix per
+tenant or security domain; cross-tenant deduplication can leak whether content
+already exists.
 
 The included benchmarks isolate archive/blob construction and upload-body
 delivery with a 4 MiB pack and in-memory S3 sinks. Five runs on an Apple M1 Max
@@ -186,14 +213,16 @@ provider processing:
 | --- | ---: | ---: | ---: |
 | Historical temporary file + sync + two rereads | 13.80 ms | 304 MB/s | 88 |
 | Historical one-pass monolithic stream | **2.66 ms** | **1,578 MB/s** | 80 |
-| Content-addressed chunks, one authority | 4.17 ms | 1,005 MB/s | 157 |
-| Content-addressed chunks, two concurrent authorities | 4.29 ms | 977 MB/s | 207 |
+| Content-addressed chunks, one authority | 3.76 ms | 1,115 MB/s | 157 |
+| Content-addressed chunks, two concurrent authorities | 3.79 ms | 1,106 MB/s | 207 |
 
-The current one-authority blob path is 3.3x faster than the original temporary
+The current one-authority blob path is 3.7x faster than the original temporary
 archive path. Its extra whole-file/chunk hashing, descriptor, and requests cost
-about 57% relative to the simpler monolithic stream. Concurrent fanout added
-about 3% with memory sinks; over a real network, acknowledgement waits for the
-slower authority. Run both current variants on the target host with:
+about 41% relative to the simpler monolithic stream. Concurrent fanout added
+less than 1% with memory sinks; over a real network, acknowledgement waits for
+the slower authority. This stage microbenchmark does not include the two parent
+certificate reads, two certificate writes, or primary manifest write in the
+commit phase. Run both current variants on the target host with:
 
 ```sh
 go test ./internal/wal -run '^$' \
@@ -467,13 +496,14 @@ DigitalOcean Spaces uses the included per-repository writer coordinator because
 its object API cannot perform the required manifest CAS. The coordinator does
 not yet have distributed leases or automatic primary failover, so operators
 must ensure that only one instance is active for a Spaces-backed repository.
-One S3 bucket is still one administrative failure domain. Walgit's optional
-secondary blob store now requires large payload chunks and their descriptors
-to reach two authorities before publication, but manifests and commit ordering
-remain primary-only. The hash-chained dual-authority commit certificate and
-repair/scrub worker required for strict provider-loss durability are not yet
-built. Ordinary provider replication, versioning, or RAID alone must not be
-described as satisfying that policy.
+One S3 bucket is still one administrative failure domain. With
+`WALGIT_REQUIRE_DUAL_AUTHORITY`, new repositories retain independently
+replayable data and hash-chained ordering in both authorities and can recover
+after complete primary-manifest/WAL/blob loss. The remaining operational gap is
+continuous privileged scrub/repair plus independently enforced retention or
+Object Lock. Without those controls, undetected deletion on one authority
+followed by loss of the other can still defeat the guarantee. Ordinary provider
+replication, versioning, or RAID alone must not be described as equivalent.
 There is no built-in service discovery, rendezvous-hash router, gossip, or
 cache warming. The system also has no Git LFS protocol integration,
 admission-control

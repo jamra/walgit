@@ -33,8 +33,10 @@ Publication order is:
 2. Wait for every configured blob authority to verify every chunk.
 3. Store and verify the external transaction descriptor in every authority.
 4. Publish the immutable WAL stub to the primary store.
-5. Publish the primary manifest update using its normal CAS/single-writer rule.
-6. Acknowledge the Git reference transaction only after that commit point.
+5. In dual-authority mode, publish the hash-chained commit certificate to both
+   authorities.
+6. Publish the primary manifest update using its single-writer rule.
+7. Acknowledge the Git reference transaction only after those boundaries.
 
 A failed or crashed attempt can leave unreferenced chunks, but cannot publish a
 manifest that references a chunk which the configured blob boundary did not
@@ -89,6 +91,13 @@ repair is not: immutable foreground credentials should not be able to replace
 a corrupt object, and choosing a repair source belongs in an audited,
 privileged scrubber.
 
+Set `WALGIT_REQUIRE_DUAL_AUTHORITY=true` instead of the blob-only requirement
+when commit ordering must also survive primary loss. This forces small and
+metadata-only transactions into the blob path and certifies their descriptors
+on both stores. S3 deployments must also use the repository-scoped single
+writer. The full format and recovery rules are in
+[the certificate protocol](certificates.md).
+
 ## Recovery and compatibility
 
 Replay resolves and verifies the external descriptor, downloads its chunks,
@@ -114,14 +123,10 @@ transactions, and retention windows, followed by an independently verified
 sweep. Until then, leaking an orphan created by a failed upload is the safe
 choice.
 
-## Durability boundary still missing
+## Remaining operational boundary
 
-Dual blob writes protect the large payload and its descriptor, not the whole
-repository authority. The current manifest and tiny WAL stub are primary-only.
-Total primary-provider loss can therefore lose authoritative ordering even when
-all payload bytes survive in the secondary.
-
-The next reliability milestone is a hash-chained commit certificate replicated
-to both authorities before acknowledgement, plus head recovery, scrub/repair,
-retention enforcement, and disaster-restore drills. See
-[the reliability model](reliability.md) for the exact remaining protocol.
+The certificate protocol now preserves independently replayable ordering and
+payloads across primary loss for repositories initialized in dual-authority
+mode. The next reliability milestone is continuous scrub/repair with privileged
+credentials, independently enforced retention, and recurring disaster-restore
+drills. See [the reliability model](reliability.md) for the exact boundary.
