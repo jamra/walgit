@@ -1,0 +1,70 @@
+{
+  "schema": 1,
+  "run": {
+    "date": "2026-09-07",
+    "commit": "bac4ed41bf06365bb91984f457ad44608af6bbef",
+    "region": "us-east-1",
+    "availability_zone": "us-east-1a",
+    "availability_zone_id": "use1-az4",
+    "instance_type": "c7g.large",
+    "operating_system": "Amazon Linux 2023",
+    "architecture": "arm64",
+    "git_version": "2.50.1",
+    "go_version": "1.26.7",
+    "pushes_per_measured_case": 100,
+    "warmup_pushes_per_s3_class": 10,
+    "blob_bytes": 65536,
+    "notes": "S3 cases used two cache nodes. Warmups are excluded. Pushes per second is 1000 divided by mean push latency in milliseconds."
+  },
+  "s3_correctness": {
+    "final_generation": 102,
+    "final_reference_count": 3,
+    "wal_bytes": 7180288,
+    "all_cache_reconciliations_passed": true,
+    "all_git_fsck_strict_checks_passed": true,
+    "all_randomized_prefix_cleanups_completed": true
+  },
+  "results": {
+    "raw_git_local": {
+      "push_latency_ms": {"mean": 16.15809, "p50": 16.046, "p90": 16.561, "p99": 16.95, "max": 27.849},
+      "pushes_per_second": 61.88848119377425
+    },
+    "walgit_local_filesystem": {
+      "push_latency_ms": {"mean": 30.21686, "p50": 30.084, "p90": 32.417, "p99": 33.102, "max": 33.567},
+      "pushes_per_second": 33.094097481559864,
+      "restore_ms": 285.328,
+      "checkpoint_create_ms": 139.477,
+      "checkpoint_restore_ms": 31.905
+    },
+    "s3_standard_direct": {
+      "push_latency_ms": {"mean": 343.32345, "p50": 338.986, "p90": 373.403, "p99": 442.824, "max": 477.123},
+      "cross_node_read_ms": {"mean": 114.10422, "p50": 112.34, "p90": 121.477, "p99": 145.139, "max": 183.196},
+      "pushes_per_second": 2.912705770099022,
+      "consistency_mode": "conditional-manifest-cas",
+      "cleanup_complete": true
+    },
+    "s3_standard_persistent_writer": {
+      "push_latency_ms": {"mean": 194.60452, "p50": 191.66, "p90": 231.522, "p99": 245.467, "max": 253.271},
+      "cross_node_read_ms": {"mean": 91.62648, "p50": 89.48, "p90": 96.866, "p99": 148.227, "max": 199.518},
+      "pushes_per_second": 5.138626796869021,
+      "consistency_mode": "coordinated-single-writer",
+      "mean_batch": 1,
+      "cleanup_complete": true
+    },
+    "s3_express_direct": {
+      "push_latency_ms": {"mean": 215.60877, "p50": 215.207, "p90": 245.755, "p99": 260.062, "max": 277.311},
+      "cross_node_read_ms": {"mean": 61.93169, "p50": 57.81, "p90": 74.231, "p99": 78.551, "max": 79.61},
+      "pushes_per_second": 4.638034417708215,
+      "consistency_mode": "conditional-manifest-cas",
+      "cleanup_complete": true
+    },
+    "s3_express_persistent_writer": {
+      "push_latency_ms": {"mean": 71.89617, "p50": 71.699, "p90": 75.245, "p99": 77.614, "max": 82.11},
+      "cross_node_read_ms": {"mean": 57.58859, "p50": 55.522, "p90": 69.78, "p99": 77.954, "max": 120.435},
+      "pushes_per_second": 13.908943954874643,
+      "consistency_mode": "coordinated-single-writer",
+      "mean_batch": 1,
+      "cleanup_complete": true
+    }
+  }
+}

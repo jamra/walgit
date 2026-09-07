@@ -107,6 +107,47 @@ go build -o ./bin/walgit ./cmd/walgit
 ./bin/walgit bench -pushes 100 -blob-bytes 65536 -persistent-writer
 ```
 
+### AWS S3 Standard versus S3 Express One Zone
+
+One live AWS run on 2026-09-07 used commit `bac4ed4`, a `c7g.large` Amazon
+Linux 2023 runner in `us-east-1a`, and an S3 Express directory bucket in the
+same physical zone (`use1-az4`). Each measured row contains 100 sequential
+pushes changing 64 KiB. Separate 10-push Standard and Express warmups were
+excluded. The S3 rows used two disposable cache nodes; push latency excludes
+the separately measured cross-node read-after-write check.
+
+| Push target | Mean | p50 | p90 | p99 | Worst | Pushes/s | Mean vs raw Git |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Raw bare Git on local EBS | **16.16 ms** | **16.05 ms** | **16.56 ms** | **16.95 ms** | **27.85 ms** | **61.89** | **1.00x** |
+| walgit, local filesystem WAL | 30.22 ms | 30.08 ms | 32.42 ms | 33.10 ms | 33.57 ms | 33.09 | 1.87x |
+| walgit, S3 Standard, direct CAS | 343.32 ms | 338.99 ms | 373.40 ms | 442.82 ms | 477.12 ms | 2.91 | 21.25x |
+| walgit, S3 Standard, persistent writer | 194.60 ms | 191.66 ms | 231.52 ms | 245.47 ms | 253.27 ms | 5.14 | 12.04x |
+| walgit, S3 Express, direct CAS | 215.61 ms | 215.21 ms | 245.76 ms | 260.06 ms | 277.31 ms | 4.64 | 13.34x |
+| walgit, S3 Express, persistent writer | **71.90 ms** | **71.70 ms** | **75.25 ms** | **77.61 ms** | **82.11 ms** | **13.91** | **4.45x** |
+
+Among the durable AWS configurations, same-AZ Express plus the persistent
+writer reduced mean push latency by 63.1% (2.71x faster) and p99 by 68.4%
+relative to Standard plus the persistent writer. Express reduced the direct
+CAS mean by 37.2% relative to Standard. The persistent writer formed no groups
+in this sequential workload (`mean_batch=1`), so its improvement came from
+reusing the SDK client, connections, credentials, and coordinator process—not
+from amortizing commits.
+
+| Cross-node read after write | Mean | p50 | p90 | p99 | Worst |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| S3 Standard, direct CAS | 114.10 ms | 112.34 ms | 121.48 ms | 145.14 ms | 183.20 ms |
+| S3 Standard, persistent writer | 91.63 ms | 89.48 ms | 96.87 ms | 148.23 ms | 199.52 ms |
+| S3 Express, direct CAS | 61.93 ms | 57.81 ms | 74.23 ms | 78.55 ms | 79.61 ms |
+| S3 Express, persistent writer | **57.59 ms** | **55.52 ms** | **69.78 ms** | **77.95 ms** | 120.44 ms |
+
+Every successful AWS run reached generation 102 with three verified refs,
+reconciled both caches, passed `git fsck --strict`, and removed its randomized
+benchmark prefix. The first attempted AWS run also exposed that real AWS S3
+requires a known `Content-Length` for these streamed `PutObject` requests.
+Commit `bac4ed4` now computes the exact tar length from metadata and file sizes
+without rereading object contents or spooling the upload. Full tests and the
+live Standard and Express runs pass with that fix.
+
 Additional measured results appear below:
 
 - [4 MiB in-memory S3 stage benchmark](#4-mib-in-memory-s3-stage-benchmark),

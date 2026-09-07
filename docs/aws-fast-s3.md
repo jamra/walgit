@@ -24,6 +24,25 @@ not support versioning or Object Lock. Walgit detects their names, rejects
 path-style configuration, and uses directory-bucket-compatible benchmark
 cleanup.
 
+Real AWS S3 also requires a known HTTP content length for walgit's streamed
+archive uploads. Walgit calculates the exact tar length from metadata and file
+sizes before opening the upload stream. It does not reread file contents,
+retain the complete archive in memory, or write a local spool file. The body is
+still produced once through the hashing upload pipe.
+
+## Measured result
+
+The first same-AZ AWS benchmark is recorded in the
+[README](../README.md#aws-s3-standard-versus-s3-express-one-zone). On a
+`c7g.large`, Express plus the persistent writer averaged 71.90 ms per 64 KiB
+push versus 194.60 ms for Standard plus the persistent writer. That is a 63.1%
+latency reduction, or 2.71x the push rate. Raw local Git averaged 16.16 ms, so
+Express did not beat the local filesystem baseline.
+
+These are one-run development measurements, not an AWS service claim. Both
+AWS variants completed the same correctness checks and cleaned their isolated
+object prefixes.
+
 ## Safe benchmark setup
 
 Use AWS CLI v2 and authenticate first. The machine currently used to develop
