@@ -168,6 +168,15 @@ func TestBenchmarkRestoresRepository(t *testing.T) {
 	}
 }
 
+func TestClassifyS3StorageClass(t *testing.T) {
+	if got := classifyS3StorageClass("s3://repo--usw2-az1--x-s3/bench"); got != "express-one-zone" {
+		t.Fatalf("directory bucket class = %q", got)
+	}
+	if got := classifyS3StorageClass("s3://ordinary-bucket/bench"); got != "standard-or-general-purpose" {
+		t.Fatalf("general-purpose bucket class = %q", got)
+	}
+}
+
 func TestDualAuthorityBenchmarkSafetyValidation(t *testing.T) {
 	var output strings.Builder
 	if err := BenchmarkDualAuthorities("s3://bucket/a", "s3://bucket/a", 1, 1, true, false, &output); err == nil || !strings.Contains(err.Error(), "different locations") {

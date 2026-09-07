@@ -245,6 +245,9 @@ func openS3Configured(location string, secondary, repair bool) (*S3Store, error)
 			)))
 		}
 	}
+	if isS3DirectoryBucket(bucket) && pathStyle {
+		return nil, errors.New("S3 Express directory buckets require virtual-hosted-style requests; disable WALGIT_S3_PATH_STYLE")
+	}
 	if repair {
 		role := "PRIMARY"
 		if secondary {
@@ -1204,7 +1207,10 @@ func (s *S3Store) deleteRepository(repoID string) error {
 }
 
 func (s *S3Store) deleteKeysWithPrefix(prefix string) error {
-	if versioned, ok := s.client.(s3VersionCleanupClient); ok {
+	// Directory buckets do not support S3 Versioning or ListObjectVersions.
+	// Their names are part of the AWS API contract, so skip that general-purpose
+	// bucket cleanup phase and remove current objects directly.
+	if versioned, ok := s.client.(s3VersionCleanupClient); ok && !isS3DirectoryBucket(s.bucket) {
 		type versionedKey struct{ key, version string }
 		var versions []versionedKey
 		var keyMarker, versionMarker *string
@@ -1263,6 +1269,10 @@ func (s *S3Store) deleteKeysWithPrefix(prefix string) error {
 		}
 	}
 	return nil
+}
+
+func isS3DirectoryBucket(bucket string) bool {
+	return strings.HasSuffix(bucket, "--x-s3")
 }
 
 func (s *S3Store) deleteObjectVersion(key, version string) error {

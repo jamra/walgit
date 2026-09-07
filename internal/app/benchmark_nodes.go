@@ -32,6 +32,7 @@ type multiNodeBenchmarkResult struct {
 	WALBytes                   int64                     `json:"wal_bytes"`
 	FinalHead                  string                    `json:"final_head"`
 	Storage                    string                    `json:"storage"`
+	S3StorageClass             string                    `json:"s3_storage_class,omitempty"`
 	ConsistencyMode            string                    `json:"consistency_mode"`
 	StoreLocation              string                    `json:"store_location,omitempty"`
 	CleanupComplete            bool                      `json:"cleanup_complete"`
@@ -62,6 +63,7 @@ func BenchmarkNodesAtStore(nodes, pushes, blobBytes int, storeBase string, keep 
 	}
 	store := filepath.Join(root, "store")
 	storage := "filesystem"
+	s3StorageClass := ""
 	consistencyMode := "conditional-manifest-cas"
 	cleanupComplete := true
 	cleanupNeeded := false
@@ -75,6 +77,7 @@ func BenchmarkNodesAtStore(nodes, pushes, blobBytes int, storeBase string, keep 
 		}
 		store = strings.TrimRight(storeBase, "/") + fmt.Sprintf("/walgit-benchmark-%s-%x", time.Now().UTC().Format("20060102T150405Z"), random)
 		storage = "s3"
+		s3StorageClass = classifyS3StorageClass(storeBase)
 		cleanupComplete = false
 		cleanupNeeded = !keep
 		defer func() {
@@ -276,7 +279,7 @@ func BenchmarkNodesAtStore(nodes, pushes, blobBytes int, storeBase string, keep 
 		CrossNodeReadLatency: summarizeLatencies(readSamples), ConcurrentWriteLatency: summarizeLatencies(concurrentSamples),
 		ConcurrentWriteBatchMillis: float64(batchElapsed.Microseconds()) / 1000,
 		FinalGeneration:            manifest.Generation, FinalReferenceCount: len(manifest.Refs), WALBytes: walBytes, FinalHead: finalHead,
-		Storage: storage, ConsistencyMode: consistencyMode, CleanupComplete: cleanupComplete,
+		Storage: storage, S3StorageClass: s3StorageClass, ConsistencyMode: consistencyMode, CleanupComplete: cleanupComplete,
 	}
 	if writerHandle != nil {
 		stats := writerHandle.Stats()
@@ -299,6 +302,14 @@ func BenchmarkNodesAtStore(nodes, pushes, blobBytes int, storeBase string, keep 
 	encoder := json.NewEncoder(output)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(result)
+}
+
+func classifyS3StorageClass(location string) string {
+	bucket, _, _ := strings.Cut(strings.TrimPrefix(location, "s3://"), "/")
+	if strings.HasSuffix(bucket, "--x-s3") {
+		return "express-one-zone"
+	}
+	return "standard-or-general-purpose"
 }
 
 func benchmarkExecutable() (string, error) {

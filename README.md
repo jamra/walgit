@@ -19,6 +19,11 @@ conditional `PutObject` must put one explicitly fenced writer in front of each
 repository. Content-addressed chunk replication remains an opt-in experiment;
 it is no longer imposed on the default push path.
 
+For AWS deployment and S3 Express One Zone benchmarking, see
+[Fast S3 on AWS](docs/aws-fast-s3.md). S3 Standard is the current multi-AZ
+recommendation; Express is the low-latency experiment until acknowledged
+commits are mirrored into a second AZ.
+
 ## Build and benchmark
 
 ```sh

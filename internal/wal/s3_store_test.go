@@ -183,6 +183,32 @@ func TestS3BenchmarkCleanupRequiresGeneratedChildPrefix(t *testing.T) {
 	}
 }
 
+func TestS3ExpressDirectoryBucketRejectsPathStyle(t *testing.T) {
+	t.Setenv("WALGIT_S3_PATH_STYLE", "true")
+	_, err := openS3Single("s3://benchmark--usw2-az1--x-s3/walgit", false)
+	if err == nil || !strings.Contains(err.Error(), "virtual-hosted-style") {
+		t.Fatalf("directory bucket accepted path-style requests: %v", err)
+	}
+}
+
+func TestS3ExpressBenchmarkCleanupSkipsUnsupportedVersionListing(t *testing.T) {
+	client := &directoryMemoryS3{memoryS3: newMemoryS3()}
+	store := &S3Store{
+		client: client, bucket: "benchmark--usw2-az1--x-s3",
+		prefix: "bench/walgit-benchmark-20260907T120000Z-0123456789abcdef0123456789abcdef", timeout: time.Second,
+	}
+	client.objects[store.key("repo", "manifest.json")] = memoryS3Object{data: []byte("manifest")}
+	if err := store.deletePrefix(); err != nil {
+		t.Fatal(err)
+	}
+	if client.versionCalls != 0 {
+		t.Fatalf("directory bucket cleanup made %d version-list calls", client.versionCalls)
+	}
+	if len(client.objects) != 0 {
+		t.Fatalf("directory bucket cleanup left objects: %#v", client.objects)
+	}
+}
+
 func TestS3SingleWriterInitializationDoesNotReplaceExistingManifest(t *testing.T) {
 	store := &S3Store{
 		client: newMemoryS3(), bucket: "bucket", prefix: "walgit", timeout: time.Second,
@@ -700,6 +726,16 @@ type memoryS3 struct {
 	putCalls  int
 	getCalls  int
 	headCalls int
+}
+
+type directoryMemoryS3 struct {
+	*memoryS3
+	versionCalls int
+}
+
+func (m *directoryMemoryS3) ListObjectVersions(_ context.Context, _ *s3.ListObjectVersionsInput, _ ...func(*s3.Options)) (*s3.ListObjectVersionsOutput, error) {
+	m.versionCalls++
+	return nil, errors.New("ListObjectVersions is unsupported for directory buckets")
 }
 
 type memoryS3Object struct {
