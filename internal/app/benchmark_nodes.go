@@ -81,7 +81,7 @@ func BenchmarkNodesAtStore(nodes, pushes, blobBytes int, storeBase string, keep 
 			if !cleanupNeeded {
 				return
 			}
-			if err := wal.DeleteS3Repository(store, "multinode"); err != nil && returnErr == nil {
+			if err := wal.DeleteS3BenchmarkPrefix(store); err != nil && returnErr == nil {
 				returnErr = fmt.Errorf("clean up isolated benchmark prefix: %w", err)
 			}
 		}()
@@ -286,7 +286,7 @@ func BenchmarkNodesAtStore(nodes, pushes, blobBytes int, storeBase string, keep 
 		result.StoreLocation = store
 	}
 	if cleanupNeeded {
-		if err := wal.DeleteS3Repository(store, "multinode"); err != nil {
+		if err := wal.DeleteS3BenchmarkPrefix(store); err != nil {
 			return fmt.Errorf("clean up isolated benchmark prefix: %w", err)
 		}
 		cleanupNeeded = false

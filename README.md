@@ -11,6 +11,8 @@ The enforced crash-safety guarantees, failure behavior, and stronger
 dual-authority deployment needed for provider-loss durability are described in
 [the reliability model](docs/reliability.md). Continuous integrity verification
 and conservative recovery are covered by the [scrub and repair runbook](docs/scrub-repair.md).
+Independent provider-loss exercises and the layered S3 latency benchmark are
+covered by the [disaster drill guide](docs/disaster-drills.md).
 
 The filesystem backend provides a local correctness and performance baseline.
 The S3-compatible backend stores small transactions inline and splits object
@@ -41,8 +43,9 @@ that child when it finishes:
 ```
 
 Cleanup is deliberately refused unless the generated path contains a
-`walgit-benchmark-*` segment. Use `-keep` only when the isolated objects should
-remain for inspection.
+`walgit-benchmark-*` segment. Cleanup includes repository-local data and the
+global content-addressed blobs and certificates inside that generated child.
+Use `-keep` only when the isolated objects should remain for inspection.
 
 The benchmark reports mean, p50, p90, p99, and maximum latency for plain Git
 and WAL-backed Git. It then:
@@ -102,6 +105,7 @@ machine-readable commands. Repair requires an explicit, fully verified source:
 export WALGIT_BLOB_SECONDARY_STORE=/mnt/independent-b/walgit
 walgit scrub -store /mnt/independent-a/walgit -id origin
 walgit repair -store /mnt/independent-a/walgit -id origin -source primary
+walgit drill -store /mnt/independent-a/walgit -id origin -source secondary
 ```
 
 For S3, repair additionally requires the dedicated
@@ -125,6 +129,25 @@ walgit retention-check \
 See the [retention policy](docs/retention.md). The explicit
 `WALGIT_ALLOW_UNPROTECTED_S3=true` escape hatch is for benchmarks only and
 invalidates provider-loss durability claims.
+
+To measure live durability cost rather than the filesystem implementation,
+`bench-dual` compares local raw Git, one S3 authority, replicated blobs, and
+full dual-authority certificate commits. It then scrubs both authorities and
+independently restores and fscks from each:
+
+```sh
+walgit bench-dual \
+  -primary s3://independent-a/benchmarks \
+  -secondary s3://independent-b/benchmarks \
+  -pushes 100 \
+  -blob-bytes 65536 \
+  -allow-unprotected
+```
+
+The explicit unprotected mode is disposable performance testing only. A real
+Object Lock run requires the retention environment above plus `-keep`, because
+the benchmark must not pretend it can delete retention-locked versions. See
+the [disaster drill and benchmark guide](docs/disaster-drills.md).
 
 ## S3-compatible storage
 
@@ -150,7 +173,9 @@ The bucket identity needs `GetObject`, `PutObject`, `HeadObject`,
 `ListBucket`, and `DeleteObject` for the configured prefix. Strict retention
 checks additionally need `GetBucketVersioning` and
 `GetObjectLockConfiguration`, and immutable uploads must be allowed to set
-Object Lock retention. S3 conditional writes must be supported; a losing
+Object Lock retention. Disposable benchmark cleanup also needs
+`ListBucketVersions` and permission to delete versions under its generated
+prefix. S3 conditional writes must be supported; a losing
 manifest writer receives a precondition failure, reloads the winner, and
 retries against the new ETag.
 

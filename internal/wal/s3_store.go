@@ -35,6 +35,10 @@ type s3Client interface {
 	ListObjectsV2(context.Context, *s3.ListObjectsV2Input, ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
 }
 
+type s3VersionCleanupClient interface {
+	ListObjectVersions(context.Context, *s3.ListObjectVersionsInput, ...func(*s3.Options)) (*s3.ListObjectVersionsOutput, error)
+}
+
 type S3Store struct {
 	client              s3Client
 	bucket              string
@@ -1101,44 +1105,121 @@ func (s *S3Store) key(repoID, relative string) string {
 func (s *S3Store) repoPrefix(repoID string) string { return s.key(repoID, "") + "/" }
 
 func DeleteS3Repository(location, repoID string) error {
+	if err := validateS3BenchmarkLocation(location); err != nil {
+		return err
+	}
+	store, err := openS3Single(location, false)
+	if err != nil {
+		return err
+	}
+	return store.deleteRepository(repoID)
+}
+
+// DeleteS3BenchmarkPrefix removes every object version beneath one generated
+// benchmark prefix, including global content-addressed blobs and certificates.
+// It cannot be pointed at a bucket or ordinary application prefix.
+func DeleteS3BenchmarkPrefix(location string) error {
+	return DeleteS3BenchmarkPrefixWithRole(location, false)
+}
+
+// DeleteS3BenchmarkPrefixWithRole selects the credential set used for cleanup.
+func DeleteS3BenchmarkPrefixWithRole(location string, secondary bool) error {
+	if err := validateS3BenchmarkLocation(location); err != nil {
+		return err
+	}
+	store, err := openS3Single(location, secondary)
+	if err != nil {
+		return err
+	}
+	return store.deletePrefix()
+}
+
+func validateS3BenchmarkLocation(location string) error {
 	if !strings.HasPrefix(location, "s3://") {
 		return errors.New("S3 cleanup requires an s3:// location")
 	}
 	_, prefix, ok := strings.Cut(strings.TrimPrefix(location, "s3://"), "/")
-	if !ok {
+	if !ok || strings.Trim(prefix, "/") == "" {
 		return errors.New("refusing S3 cleanup without an isolated prefix")
 	}
-	isolated := false
 	for _, segment := range strings.Split(prefix, "/") {
-		if strings.HasPrefix(segment, "walgit-benchmark-") {
-			isolated = true
-			break
+		if validBenchmarkSegment(segment) {
+			return nil
 		}
 	}
-	if !isolated {
-		return errors.New("refusing S3 cleanup outside a walgit-benchmark-* prefix")
+	return errors.New("refusing S3 cleanup outside a walgit-benchmark-* prefix")
+}
+
+func validBenchmarkSegment(segment string) bool {
+	const marker = "walgit-benchmark-"
+	if !strings.HasPrefix(segment, marker) {
+		return false
 	}
-	backend, err := OpenS3(location)
-	if err != nil {
-		return err
+	value := strings.TrimPrefix(segment, marker)
+	separator := strings.LastIndexByte(value, '-')
+	if separator < 0 {
+		return false
 	}
-	store, ok := backend.(*S3Store)
-	if !ok {
-		return errors.New("S3 cleanup opened an unexpected backend")
+	if _, err := time.Parse("20060102T150405Z", value[:separator]); err != nil {
+		return false
 	}
-	return store.deleteRepository(repoID)
+	random, err := hex.DecodeString(value[separator+1:])
+	return err == nil && len(random) == 16
+}
+
+func (s *S3Store) deletePrefix() error {
+	prefix := strings.TrimSuffix(s.prefix, "/") + "/"
+	if prefix == "/" {
+		return errors.New("refusing to delete an empty S3 prefix")
+	}
+	return s.deleteKeysWithPrefix(prefix)
 }
 
 func (s *S3Store) deleteRepository(repoID string) error {
 	if err := validateID(repoID); err != nil {
 		return err
 	}
+	return s.deleteKeysWithPrefix(s.repoPrefix(repoID))
+}
+
+func (s *S3Store) deleteKeysWithPrefix(prefix string) error {
+	if versioned, ok := s.client.(s3VersionCleanupClient); ok {
+		type versionedKey struct{ key, version string }
+		var versions []versionedKey
+		var keyMarker, versionMarker *string
+		for {
+			ctx, cancel := s.context()
+			out, err := versioned.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+				Bucket: aws.String(s.bucket), Prefix: aws.String(prefix),
+				KeyMarker: keyMarker, VersionIdMarker: versionMarker,
+			})
+			cancel()
+			if err != nil {
+				return err
+			}
+			for _, object := range out.Versions {
+				versions = append(versions, versionedKey{key: aws.ToString(object.Key), version: aws.ToString(object.VersionId)})
+			}
+			for _, marker := range out.DeleteMarkers {
+				versions = append(versions, versionedKey{key: aws.ToString(marker.Key), version: aws.ToString(marker.VersionId)})
+			}
+			if !aws.ToBool(out.IsTruncated) {
+				break
+			}
+			keyMarker, versionMarker = out.NextKeyMarker, out.NextVersionIdMarker
+		}
+		for _, object := range versions {
+			if err := s.deleteObjectVersion(object.key, object.version); err != nil {
+				return err
+			}
+		}
+	}
 	var token *string
 	var keys []string
 	for {
 		ctx, cancel := s.context()
 		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket: aws.String(s.bucket), Prefix: aws.String(s.repoPrefix(repoID)), ContinuationToken: token,
+			Bucket: aws.String(s.bucket), Prefix: aws.String(prefix), ContinuationToken: token,
 		})
 		cancel()
 		if err != nil {
@@ -1161,6 +1242,15 @@ func (s *S3Store) deleteRepository(repoID string) error {
 		}
 	}
 	return nil
+}
+
+func (s *S3Store) deleteObjectVersion(key, version string) error {
+	ctx, cancel := s.context()
+	defer cancel()
+	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(key), VersionId: aws.String(version),
+	})
+	return err
 }
 
 func (s *S3Store) context() (context.Context, context.CancelFunc) {

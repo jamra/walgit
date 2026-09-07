@@ -114,6 +114,18 @@ func main() {
 		if encodeErr := json.NewEncoder(os.Stdout).Encode(report); encodeErr != nil && err == nil {
 			err = encodeErr
 		}
+	case "drill":
+		fs := flag.NewFlagSet("drill", flag.ExitOnError)
+		store := fs.String("store", "", "path or s3:// URI for the primary durable authority")
+		id := fs.String("id", "", "repository ID")
+		source := fs.String("source", "", "authority to restore independently: primary or secondary")
+		keep := fs.Bool("keep", false, "keep the restored repository")
+		_ = fs.Parse(os.Args[2:])
+		var report any
+		report, err = app.DisasterRestoreDrill(*store, *id, *source, *keep)
+		if encodeErr := json.NewEncoder(os.Stdout).Encode(report); encodeErr != nil && err == nil {
+			err = encodeErr
+		}
 	case "serve":
 		fs := flag.NewFlagSet("serve", flag.ExitOnError)
 		listen := fs.String("listen", "127.0.0.1:8080", "HTTP listen address")
@@ -173,6 +185,16 @@ func main() {
 		} else {
 			err = app.Benchmark(*pushes, *bytes, *keep, os.Stdout)
 		}
+	case "bench-dual":
+		fs := flag.NewFlagSet("bench-dual", flag.ExitOnError)
+		pushes := fs.Int("pushes", 100, "number of pushes")
+		bytes := fs.Int("blob-bytes", 64*1024, "bytes changed per push")
+		primary := fs.String("primary", "", "primary base s3:// URI")
+		secondary := fs.String("secondary", "", "independent secondary base s3:// URI")
+		allowUnprotected := fs.Bool("allow-unprotected", false, "benchmark without Object Lock; invalidates durability claims")
+		keep := fs.Bool("keep", false, "keep isolated remote objects and local benchmark files")
+		_ = fs.Parse(os.Args[2:])
+		err = app.BenchmarkDualAuthorities(*primary, *secondary, *pushes, *bytes, *allowUnprotected, *keep, os.Stdout)
 	default:
 		usage()
 		os.Exit(2)
@@ -184,5 +206,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: walgit <init|hook|restore|reconcile|gateway|compact|gc|scrub|repair|retention-check|serve|writer|bench> [options]")
+	fmt.Fprintln(os.Stderr, "usage: walgit <init|hook|restore|reconcile|gateway|compact|gc|scrub|repair|retention-check|drill|serve|writer|bench|bench-dual> [options]")
 }

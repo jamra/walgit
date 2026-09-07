@@ -151,6 +151,38 @@ func TestS3DeleteRepositoryIsConfinedToRepositoryPrefix(t *testing.T) {
 	}
 }
 
+func TestS3DeleteBenchmarkPrefixIncludesGlobalObjectsButNotAdjacentPrefixes(t *testing.T) {
+	client := newMemoryS3()
+	store := &S3Store{client: client, bucket: "bucket", prefix: "benchmarks/walgit-benchmark-random", timeout: time.Second}
+	client.objects["benchmarks/walgit-benchmark-random/repo/manifest.json"] = memoryS3Object{data: []byte("manifest")}
+	client.objects["benchmarks/walgit-benchmark-random/.walgit-blobs/sha256/aa"] = memoryS3Object{data: []byte("blob")}
+	client.objects["benchmarks/walgit-benchmark-random-adjacent/repo/manifest.json"] = memoryS3Object{data: []byte("preserve")}
+	if err := store.deletePrefix(); err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	for key := range client.objects {
+		if strings.HasPrefix(key, "benchmarks/walgit-benchmark-random/") {
+			t.Fatalf("benchmark object survived cleanup: %s", key)
+		}
+	}
+	if _, ok := client.objects["benchmarks/walgit-benchmark-random-adjacent/repo/manifest.json"]; !ok {
+		t.Fatal("cleanup removed an adjacent prefix")
+	}
+}
+
+func TestS3BenchmarkCleanupRequiresGeneratedChildPrefix(t *testing.T) {
+	for _, location := range []string{"s3://bucket", "s3://bucket/production", "file:///tmp/walgit-benchmark-test", "s3://bucket/walgit-benchmark-"} {
+		if err := validateS3BenchmarkLocation(location); err == nil {
+			t.Fatalf("cleanup accepted unsafe location %q", location)
+		}
+	}
+	if err := validateS3BenchmarkLocation("s3://bucket/bench/walgit-benchmark-20260906T120000Z-0123456789abcdef0123456789abcdef"); err != nil {
+		t.Fatalf("cleanup rejected isolated location: %v", err)
+	}
+}
+
 func TestS3SingleWriterInitializationDoesNotReplaceExistingManifest(t *testing.T) {
 	store := &S3Store{
 		client: newMemoryS3(), bucket: "bucket", prefix: "walgit", timeout: time.Second,

@@ -33,6 +33,43 @@ func TestScrubVerifiesMatchingCertificateChainsAndPayloads(t *testing.T) {
 	}
 }
 
+func TestReplayRestoreAuthorityUsesOnlySelectedProvider(t *testing.T) {
+	store, primary, secondary := dualFilesystemStore(t)
+	id, _, entry := committedCertificateTransaction(t, store)
+	t.Setenv("WALGIT_BLOB_SECONDARY_STORE", secondary.store.Root)
+	if err := os.RemoveAll(primary.store.Root); err != nil {
+		t.Fatal(err)
+	}
+
+	var applied []RefUpdate
+	manifest, report, err := ReplayRestoreAuthority(primary.store.Root, id, "secondary", filepath.Join(t.TempDir(), "objects"), func(got ManifestEntry, meta EntryMeta) error {
+		if got.TransactionID != entry.TransactionID {
+			t.Fatalf("replayed transaction %q, want %q", got.TransactionID, entry.TransactionID)
+		}
+		applied = append(applied, meta.Updates...)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Healthy || manifest.Generation != 1 || manifest.CertificateSHA256 == "" || len(applied) != 1 {
+		t.Fatalf("unexpected independent restore: manifest=%#v report=%#v updates=%#v", manifest, report, applied)
+	}
+}
+
+func TestReplayRestoreAuthorityRejectsCorruptSelectedProvider(t *testing.T) {
+	store, primary, secondary := dualFilesystemStore(t)
+	id, _, entry := committedCertificateTransaction(t, store)
+	meta := descriptorMeta(t, secondary, entry)
+	if err := os.Remove(secondary.path(meta.Objects[0].Blob.Chunks[0].SHA256)); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WALGIT_BLOB_SECONDARY_STORE", secondary.store.Root)
+	if _, _, err := ReplayRestoreAuthority(primary.store.Root, id, "secondary", filepath.Join(t.TempDir(), "objects"), nil); err == nil || !strings.Contains(err.Error(), "not fully verified") {
+		t.Fatalf("restore accepted corrupt selected authority: %v", err)
+	}
+}
+
 func TestRepairRestoresMissingChunkAndWritesReplicatedAudit(t *testing.T) {
 	store, primary, secondary := dualFilesystemStore(t)
 	id, _, entry := committedCertificateTransaction(t, store)

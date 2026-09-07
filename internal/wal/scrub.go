@@ -83,6 +83,7 @@ type verifiedSnapshot struct {
 	headDigest   string
 	generation   uint64
 	floor        uint64
+	manifest     Manifest
 	certificates []certificateObject
 	chunks       map[string]ChunkRef
 	descriptors  map[string]struct{}
@@ -386,6 +387,12 @@ func inspectAuthority(repoID string, named namedMaintenanceAuthority) (Authority
 	}
 	snapshot := &verifiedSnapshot{
 		headDigest: digest, generation: state.certificate.Generation, floor: state.floor,
+		manifest: Manifest{
+			Version: manifestVersion, Generation: state.certificate.Generation,
+			Head: state.certificate.Head, ObjectFormat: state.certificate.ObjectFormat,
+			Refs: cloneRefs(state.certificate.Refs), Entries: append([]ManifestEntry(nil), state.entries...),
+			CertificateSHA256: digest, CertificateFloor: state.floor,
+		},
 		certificates: chain, chunks: make(map[string]ChunkRef), descriptors: make(map[string]struct{}),
 	}
 	for _, object := range chain {

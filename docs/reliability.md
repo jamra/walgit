@@ -189,8 +189,11 @@ not make that statement timeless. The remaining operational protocol is:
    privileged credentials to copy and verify missing chunks, descriptors, and
    certificate links before another failure can overlap. The exact procedure
    is in the [scrub and repair runbook](scrub-repair.md).
-4. Exercise restoration in a separate account and run `git fsck --strict`.
-5. Add a certified checkpoint migration before claiming full-history protection
+4. Regularly run `walgit drill` from each authority. The drill reads only the
+   selected provider, reconstructs an empty repository, and requires
+   `git fsck --strict`; see the [disaster drill guide](disaster-drills.md).
+5. Exercise restoration in a separate account and run `git fsck --strict`.
+6. Add a certified checkpoint migration before claiming full-history protection
    for a repository anchored above generation zero.
 
 If one authority disappears, a survivor-only tail could be an unacknowledged

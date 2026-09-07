@@ -168,6 +168,83 @@ func TestBenchmarkRestoresRepository(t *testing.T) {
 	}
 }
 
+func TestDualAuthorityBenchmarkSafetyValidation(t *testing.T) {
+	var output strings.Builder
+	if err := BenchmarkDualAuthorities("s3://bucket/a", "s3://bucket/a", 1, 1, true, false, &output); err == nil || !strings.Contains(err.Error(), "different locations") {
+		t.Fatalf("benchmark accepted identical authorities: %v", err)
+	}
+	if err := BenchmarkDualAuthorities("s3://bucket/a", "s3://other/b", 1, 1, false, false, &output); err == nil || !strings.Contains(err.Error(), "retention-locked") {
+		t.Fatalf("protected benchmark accepted destructive cleanup: %v", err)
+	}
+	primary, secondary, err := isolatedBenchmarkPrefixes("s3://one/base/", "s3://two/base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	primarySegment := filepath.Base(primary)
+	secondarySegment := filepath.Base(secondary)
+	if primarySegment != secondarySegment || !strings.HasPrefix(primarySegment, "walgit-benchmark-") {
+		t.Fatalf("benchmark prefixes are not matching isolated children: %q %q", primary, secondary)
+	}
+}
+
+func TestDisasterRestoreDrillSurvivesPrimaryLoss(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	root := t.TempDir()
+	exe := filepath.Join(root, "walgit")
+	cmd := exec.Command("go", "build", "-o", exe, "./cmd/walgit")
+	cmd.Dir = filepath.Join("..", "..")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build hook executable: %v: %s", err, out)
+	}
+	primary := filepath.Join(root, "primary")
+	secondary := filepath.Join(root, "secondary")
+	remote := filepath.Join(root, "remote.git")
+	work := filepath.Join(root, "work")
+	t.Setenv("WALGIT_EXECUTABLE", exe)
+	t.Setenv("WALGIT_BLOB_SECONDARY_STORE", secondary)
+	t.Setenv("WALGIT_REQUIRE_DUAL_AUTHORITY", "true")
+	if err := Init(remote, primary, "repo"); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"init", "-b", "main", work},
+		{"-C", work, "config", "user.name", "test"},
+		{"-C", work, "config", "user.email", "test@example.invalid"},
+	} {
+		if err := run("", "git", args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(work, "file"), []byte("independent restore\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"-C", work, "add", "file"}, {"-C", work, "commit", "-m", "initial"}} {
+		if err := run("", "git", args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	receiveGateway := shellQuote(exe) + " gateway -store " + shellQuote(primary) + " -id repo -service receive-pack"
+	if err := run("", "git", "-C", work, "push", "--receive-pack="+receiveGateway, remote, "HEAD:refs/heads/main"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(primary); err != nil {
+		t.Fatal(err)
+	}
+	report, err := DisasterRestoreDrill(primary, "repo", "secondary", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Generation != 1 || report.CertificateSHA256 == "" || report.RestoredRepository == "" || !report.IndependentAuthority.Healthy {
+		t.Fatalf("unexpected drill report: %#v", report)
+	}
+	defer os.RemoveAll(filepath.Dir(report.RestoredRepository)) //nolint:errcheck
+	if err := run("", "git", "-C", report.RestoredRepository, "fsck", "--strict"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReconcileRepairsMissingLocalRefAfterManifestCommit(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
