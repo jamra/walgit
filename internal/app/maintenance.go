@@ -45,7 +45,7 @@ func (h *gitHTTPHandler) runMaintenance() (result MaintenanceResult, err error) 
 	}
 	entryBytes := int64(0)
 	for _, entry := range manifest.Entries {
-		entryBytes += entry.Bytes
+		entryBytes += entry.Bytes + entry.PayloadBytes
 	}
 	compact := h.options.CompactAfterEntries > 0 && len(manifest.Entries) >= h.options.CompactAfterEntries
 	compact = compact || h.options.CompactAfterBytes > 0 && entryBytes >= h.options.CompactAfterBytes

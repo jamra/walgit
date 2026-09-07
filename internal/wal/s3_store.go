@@ -20,6 +20,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -44,11 +45,13 @@ type S3Store struct {
 	staged              map[string]stagedS3Transaction
 	cachedManifest      *Manifest
 	cachedETag          string
+	blobs               blobStore
 }
 
 type stagedS3Transaction struct {
-	digest string
-	bytes  int64
+	digest       string
+	bytes        int64
+	payloadBytes int64
 }
 
 type streamedArchiveResult struct {
@@ -168,6 +171,19 @@ func (s *S3Store) inspectStreamedObject(repoID, relative string, validate func(i
 }
 
 func OpenS3(location string) (Backend, error) {
+	store, err := openS3Single(location, false)
+	if err != nil {
+		return nil, err
+	}
+	blobs, err := configureBlobReplication(store.blobStorage(), location)
+	if err != nil {
+		return nil, err
+	}
+	store.blobs = blobs
+	return store, nil
+}
+
+func openS3Single(location string, secondary bool) (*S3Store, error) {
 	withoutScheme := strings.TrimPrefix(location, "s3://")
 	bucket, prefix, _ := strings.Cut(withoutScheme, "/")
 	if bucket == "" {
@@ -176,21 +192,45 @@ func OpenS3(location string) (Backend, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	options := []func(*config.LoadOptions) error{}
-	if region := os.Getenv("AWS_REGION"); region != "" {
+	region := os.Getenv("AWS_REGION")
+	endpoint := os.Getenv("WALGIT_S3_ENDPOINT")
+	pathStyle, _ := strconv.ParseBool(os.Getenv("WALGIT_S3_PATH_STYLE"))
+	if secondary {
+		if value := os.Getenv("WALGIT_BLOB_SECONDARY_REGION"); value != "" {
+			region = value
+		}
+		if value := os.Getenv("WALGIT_BLOB_SECONDARY_ENDPOINT"); value != "" {
+			endpoint = value
+		}
+		if value := os.Getenv("WALGIT_BLOB_SECONDARY_PATH_STYLE"); value != "" {
+			pathStyle, _ = strconv.ParseBool(value)
+		}
+		accessKey := os.Getenv("WALGIT_BLOB_SECONDARY_ACCESS_KEY_ID")
+		secretKey := os.Getenv("WALGIT_BLOB_SECONDARY_SECRET_ACCESS_KEY")
+		if (accessKey == "") != (secretKey == "") {
+			return nil, errors.New("secondary S3 access key and secret key must be configured together")
+		}
+		if accessKey != "" {
+			options = append(options, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+				accessKey, secretKey, os.Getenv("WALGIT_BLOB_SECONDARY_SESSION_TOKEN"),
+			)))
+		}
+	}
+	if region != "" {
 		options = append(options, config.WithRegion(region))
 	}
 	cfg, err := config.LoadDefaultConfig(ctx, options...)
 	if err != nil {
 		return nil, fmt.Errorf("load AWS configuration: %w", err)
 	}
-	if os.Getenv("WALGIT_S3_ENDPOINT") != "" {
+	if endpoint != "" {
 		cfg.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	}
 	client := s3.NewFromConfig(cfg, func(options *s3.Options) {
-		if endpoint := os.Getenv("WALGIT_S3_ENDPOINT"); endpoint != "" {
+		if endpoint != "" {
 			options.BaseEndpoint = aws.String(endpoint)
 		}
-		if value, _ := strconv.ParseBool(os.Getenv("WALGIT_S3_PATH_STYLE")); value {
+		if pathStyle {
 			options.UsePathStyle = true
 		}
 	})
@@ -263,15 +303,37 @@ func (s *S3Store) Stage(repoID, objectDir string, updates []RefUpdate) error {
 	if err != nil {
 		return err
 	}
-	meta := EntryMeta{TransactionID: txID, CreatedAt: time.Now().UTC(), Updates: updates}
+	objects, err := maybeStoreObjectBlobs(objectDir, s.blobStorage())
+	if err != nil {
+		return err
+	}
+	meta := EntryMeta{TransactionID: txID, CreatedAt: time.Now().UTC(), Updates: updates, Objects: objects}
+	if len(objects) > 0 {
+		meta, err = externalizeEntryMeta(meta, s.blobStorage())
+		if err != nil {
+			return err
+		}
+	}
 	object, err := s.putStreamedObject(repoID, "transactions/"+txID+".wal", func(w io.Writer) error {
 		return writeArchive(w, meta, objectDir)
 	}, func(r io.Reader) error {
-		return validateEntryArchive(r, txID)
+		recovered, validateErr := readEntryArchiveMeta(r)
+		if validateErr != nil {
+			return validateErr
+		}
+		recovered, validateErr = resolveEntryMeta(recovered, s.blobStorage())
+		if validateErr != nil {
+			return validateErr
+		}
+		if recovered.TransactionID != txID {
+			return fmt.Errorf("transaction mismatch: got %s, want %s", recovered.TransactionID, txID)
+		}
+		return nil
 	})
 	if err != nil {
 		return err
 	}
+	object.payloadBytes = objectBlobBytes(objects)
 	s.stateMu.Lock()
 	if s.staged == nil {
 		s.staged = make(map[string]stagedS3Transaction)
@@ -315,13 +377,27 @@ func (s *S3Store) CommitBatch(repoID string, batches [][]RefUpdate) ([]ManifestE
 			staged[i].object = object
 			continue
 		}
+		var recovered EntryMeta
 		object, err := s.inspectStreamedObject(repoID, staged[i].file, func(r io.Reader) error {
-			return validateEntryArchive(r, staged[i].txID)
+			var validateErr error
+			recovered, validateErr = readEntryArchiveMeta(r)
+			if validateErr != nil {
+				return validateErr
+			}
+			recovered, validateErr = resolveEntryMeta(recovered, s.blobStorage())
+			if validateErr != nil {
+				return validateErr
+			}
+			if recovered.TransactionID != staged[i].txID {
+				return fmt.Errorf("transaction mismatch: got %s, want %s", recovered.TransactionID, staged[i].txID)
+			}
+			return nil
 		})
 		if err != nil {
 			return nil, Manifest{}, fmt.Errorf("read staged transaction: %w", err)
 		}
 		staged[i].object = object
+		staged[i].object.payloadBytes = objectBlobBytes(recovered.Objects)
 		if staged[i].object.digest == "" {
 			return nil, Manifest{}, errors.New("staged transaction is missing its SHA-256 metadata")
 		}
@@ -362,7 +438,7 @@ func (s *S3Store) CommitBatch(repoID string, batches [][]RefUpdate) ([]ManifestE
 			generation := m.Generation + 1
 			entry := ManifestEntry{
 				Generation: generation, TransactionID: batch.txID, File: batch.file,
-				SHA256: batch.object.digest, Bytes: batch.object.bytes,
+				SHA256: batch.object.digest, Bytes: batch.object.bytes, PayloadBytes: batch.object.payloadBytes,
 			}
 			for _, update := range batch.updates {
 				if isZeroOID(update.New) {
@@ -632,7 +708,7 @@ func (s *S3Store) ReplayManifest(repoID string, generation uint64, m Manifest, g
 			return Manifest{}, err
 		}
 		hash := sha256.New()
-		meta, replayErr := readArchive(io.TeeReader(body, hash), gitObjects)
+		meta, replayErr := readArchive(io.TeeReader(body, hash), gitObjects, s.blobStorage())
 		closeErr := body.Close()
 		if replayErr != nil {
 			return Manifest{}, fmt.Errorf("replay %s: %w", entry.File, replayErr)
@@ -664,9 +740,19 @@ func (s *S3Store) CreateCheckpoint(repoID, gitObjects string, expectedGeneration
 	if len(m.Prepared) > 0 {
 		return Checkpoint{}, errors.New("cannot checkpoint while reference transactions are prepared")
 	}
+	objects, err := maybeStoreObjectBlobs(gitObjects, s.blobStorage())
+	if err != nil {
+		return Checkpoint{}, err
+	}
 	meta := CheckpointMeta{
 		Generation: m.Generation, CreatedAt: time.Now().UTC(), Head: m.Head,
-		ObjectFormat: m.ObjectFormat, Refs: cloneRefs(m.Refs),
+		ObjectFormat: m.ObjectFormat, Refs: cloneRefs(m.Refs), Objects: objects,
+	}
+	if len(objects) > 0 {
+		meta, err = externalizeCheckpointMeta(meta, s.blobStorage())
+		if err != nil {
+			return Checkpoint{}, err
+		}
 	}
 	var nonce [8]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
@@ -683,7 +769,7 @@ func (s *S3Store) CreateCheckpoint(repoID, gitObjects string, expectedGeneration
 	}
 	checkpoint := Checkpoint{
 		Generation: m.Generation, File: checkpointFile,
-		SHA256: object.digest, Bytes: object.bytes,
+		SHA256: object.digest, Bytes: object.bytes, PayloadBytes: objectBlobBytes(objects),
 	}
 	for attempt := 0; attempt < 32; attempt++ {
 		latest, etag, err := s.loadWithETag(repoID)
@@ -725,7 +811,7 @@ func (s *S3Store) RestoreCheckpoint(repoID, gitObjects string) (CheckpointMeta, 
 		return CheckpointMeta{}, err
 	}
 	hash := sha256.New()
-	meta, restoreErr := readCheckpointArchive(io.TeeReader(body, hash), gitObjects)
+	meta, restoreErr := readCheckpointArchive(io.TeeReader(body, hash), gitObjects, s.blobStorage())
 	closeErr := body.Close()
 	if restoreErr != nil {
 		return CheckpointMeta{}, restoreErr

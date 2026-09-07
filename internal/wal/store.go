@@ -27,9 +27,11 @@ type RefUpdate struct {
 }
 
 type EntryMeta struct {
-	TransactionID string      `json:"transaction_id"`
-	CreatedAt     time.Time   `json:"created_at"`
-	Updates       []RefUpdate `json:"updates"`
+	TransactionID string       `json:"transaction_id"`
+	CreatedAt     time.Time    `json:"created_at"`
+	Updates       []RefUpdate  `json:"updates"`
+	Objects       []ObjectBlob `json:"objects,omitempty"`
+	Descriptor    *ChunkRef    `json:"descriptor,omitempty"`
 }
 
 type ManifestEntry struct {
@@ -38,13 +40,15 @@ type ManifestEntry struct {
 	File          string `json:"file"`
 	SHA256        string `json:"sha256"`
 	Bytes         int64  `json:"bytes"`
+	PayloadBytes  int64  `json:"payload_bytes,omitempty"`
 }
 
 type Checkpoint struct {
-	Generation uint64 `json:"generation"`
-	File       string `json:"file"`
-	SHA256     string `json:"sha256"`
-	Bytes      int64  `json:"bytes"`
+	Generation   uint64 `json:"generation"`
+	File         string `json:"file"`
+	SHA256       string `json:"sha256"`
+	Bytes        int64  `json:"bytes"`
+	PayloadBytes int64  `json:"payload_bytes,omitempty"`
 }
 
 type CheckpointMeta struct {
@@ -53,6 +57,8 @@ type CheckpointMeta struct {
 	Head         string            `json:"head"`
 	ObjectFormat string            `json:"object_format"`
 	Refs         map[string]string `json:"refs"`
+	Objects      []ObjectBlob      `json:"objects,omitempty"`
+	Descriptor   *ChunkRef         `json:"descriptor,omitempty"`
 }
 
 type PreparedTransaction struct {
@@ -76,6 +82,7 @@ type Manifest struct {
 type Store struct {
 	Root   string
 	faults *storeFaults
+	blobs  blobStore
 }
 
 type storeFaults struct {
@@ -170,7 +177,17 @@ func (s Store) Stage(repoID, objectDir string, updates []RefUpdate) error {
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
-	meta := EntryMeta{TransactionID: txID, CreatedAt: time.Now().UTC(), Updates: updates}
+	objects, err := maybeStoreObjectBlobs(objectDir, s.blobStorage())
+	if err != nil {
+		return err
+	}
+	meta := EntryMeta{TransactionID: txID, CreatedAt: time.Now().UTC(), Updates: updates, Objects: objects}
+	if len(objects) > 0 {
+		meta, err = externalizeEntryMeta(meta, s.blobStorage())
+		if err != nil {
+			return err
+		}
+	}
 	if err := writeArchive(&durabilityWriter{store: s, writer: tmp, operation: "write staged WAL"}, meta, objectDir); err != nil {
 		tmp.Close()
 		return err
@@ -243,7 +260,14 @@ func (s Store) Commit(repoID string, updates []RefUpdate) (ManifestEntry, Manife
 		if err != nil {
 			return err
 		}
-		entry := ManifestEntry{Generation: generation, TransactionID: txID, File: name, SHA256: digest, Bytes: size}
+		payloadBytes, err := archivePayloadBytes(finalPath, s.blobStorage())
+		if err != nil {
+			return err
+		}
+		entry := ManifestEntry{
+			Generation: generation, TransactionID: txID, File: name,
+			SHA256: digest, Bytes: size, PayloadBytes: payloadBytes,
+		}
 		for _, u := range updates {
 			if isZeroOID(u.New) {
 				delete(m.Refs, u.Ref)
@@ -410,7 +434,7 @@ func (s Store) ReplayFrom(repoID string, generation uint64, gitObjects string, a
 			return Manifest{}, err
 		}
 		hash := sha256.New()
-		meta, replayErr := readArchive(io.TeeReader(f, hash), gitObjects)
+		meta, replayErr := readArchive(io.TeeReader(f, hash), gitObjects, s.blobStorage())
 		closeErr := f.Close()
 		if replayErr != nil {
 			return Manifest{}, fmt.Errorf("replay %s: %w", entry.File, replayErr)
@@ -456,9 +480,19 @@ func (s Store) CreateCheckpoint(repoID, gitObjects string, expectedGeneration ui
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
+	objects, err := maybeStoreObjectBlobs(gitObjects, s.blobStorage())
+	if err != nil {
+		return Checkpoint{}, err
+	}
 	meta := CheckpointMeta{
 		Generation: m.Generation, CreatedAt: time.Now().UTC(), Head: m.Head,
-		ObjectFormat: m.ObjectFormat, Refs: cloneRefs(m.Refs),
+		ObjectFormat: m.ObjectFormat, Refs: cloneRefs(m.Refs), Objects: objects,
+	}
+	if len(objects) > 0 {
+		meta, err = externalizeCheckpointMeta(meta, s.blobStorage())
+		if err != nil {
+			return Checkpoint{}, err
+		}
 	}
 	if err := writeCheckpointArchive(&durabilityWriter{store: s, writer: tmp, operation: "write checkpoint"}, meta, gitObjects); err != nil {
 		tmp.Close()
@@ -485,7 +519,10 @@ func (s Store) CreateCheckpoint(repoID, gitObjects string, expectedGeneration ui
 	if err := s.syncDirectory(checkpointDir, "sync checkpoint directory"); err != nil {
 		return Checkpoint{}, err
 	}
-	checkpoint := Checkpoint{Generation: m.Generation, File: filepath.ToSlash(filepath.Join("checkpoints", name)), SHA256: digest, Bytes: size}
+	checkpoint := Checkpoint{
+		Generation: m.Generation, File: filepath.ToSlash(filepath.Join("checkpoints", name)),
+		SHA256: digest, Bytes: size, PayloadBytes: objectBlobBytes(objects),
+	}
 	err = s.withLock(repoID, func() error {
 		latest, err := readManifest(dir)
 		if err != nil {
@@ -525,7 +562,7 @@ func (s Store) RestoreCheckpoint(repoID, gitObjects string) (CheckpointMeta, err
 		return CheckpointMeta{}, err
 	}
 	hash := sha256.New()
-	meta, restoreErr := readCheckpointArchive(io.TeeReader(f, hash), gitObjects)
+	meta, restoreErr := readCheckpointArchive(io.TeeReader(f, hash), gitObjects, s.blobStorage())
 	closeErr := f.Close()
 	if restoreErr != nil {
 		return CheckpointMeta{}, restoreErr
@@ -884,6 +921,9 @@ func writeArchive(w io.Writer, meta EntryMeta, objectDir string) error {
 	if _, err := tw.Write(metaJSON); err != nil {
 		return err
 	}
+	if len(meta.Objects) > 0 || meta.Descriptor != nil {
+		return tw.Close()
+	}
 	return writeObjectFiles(tw, objectDir)
 }
 
@@ -898,6 +938,9 @@ func writeCheckpointArchive(w io.Writer, meta CheckpointMeta, objectDir string) 
 	}
 	if _, err := tw.Write(metaJSON); err != nil {
 		return err
+	}
+	if len(meta.Objects) > 0 || meta.Descriptor != nil {
+		return tw.Close()
 	}
 	return writeObjectFiles(tw, objectDir)
 }
@@ -968,7 +1011,7 @@ func writeObjectFiles(tw *tar.Writer, objectDir string) error {
 	return tw.Close()
 }
 
-func readArchive(r io.Reader, objectDir string) (EntryMeta, error) {
+func readArchive(r io.Reader, objectDir string, blobs blobStore) (EntryMeta, error) {
 	tr := tar.NewReader(bufio.NewReader(r))
 	var meta EntryMeta
 	seenMeta := false
@@ -1000,13 +1043,25 @@ func readArchive(r io.Reader, objectDir string) (EntryMeta, error) {
 	if !seenMeta {
 		return meta, errors.New("entry has no metadata")
 	}
+	meta, err := resolveEntryMeta(meta, blobs)
+	if err != nil {
+		return meta, err
+	}
 	if err := syncObjectDirectories(objectDir, touched); err != nil {
 		return meta, fmt.Errorf("make replayed objects durable: %w", err)
+	}
+	if len(meta.Objects) > 0 {
+		if blobs == nil {
+			return meta, errors.New("entry references blobs but no blob store is configured")
+		}
+		if err := restoreObjectBlobs(meta.Objects, objectDir, blobs); err != nil {
+			return meta, fmt.Errorf("restore entry blobs: %w", err)
+		}
 	}
 	return meta, nil
 }
 
-func readCheckpointArchive(r io.Reader, objectDir string) (CheckpointMeta, error) {
+func readCheckpointArchive(r io.Reader, objectDir string, blobs blobStore) (CheckpointMeta, error) {
 	tr := tar.NewReader(bufio.NewReader(r))
 	var meta CheckpointMeta
 	seenMeta := false
@@ -1038,13 +1093,36 @@ func readCheckpointArchive(r io.Reader, objectDir string) (CheckpointMeta, error
 	if !seenMeta {
 		return meta, errors.New("checkpoint has no metadata")
 	}
+	meta, err := resolveCheckpointMeta(meta, blobs)
+	if err != nil {
+		return meta, err
+	}
 	if err := syncObjectDirectories(objectDir, touched); err != nil {
 		return meta, fmt.Errorf("make restored checkpoint objects durable: %w", err)
+	}
+	if len(meta.Objects) > 0 {
+		if blobs == nil {
+			return meta, errors.New("checkpoint references blobs but no blob store is configured")
+		}
+		if err := restoreObjectBlobs(meta.Objects, objectDir, blobs); err != nil {
+			return meta, fmt.Errorf("restore checkpoint blobs: %w", err)
+		}
 	}
 	return meta, nil
 }
 
 func validateEntryArchive(r io.Reader, expectedTransactionID string) error {
+	meta, err := readEntryArchiveMeta(r)
+	if err != nil {
+		return err
+	}
+	if meta.TransactionID != expectedTransactionID {
+		return fmt.Errorf("transaction mismatch: got %s, want %s", meta.TransactionID, expectedTransactionID)
+	}
+	return nil
+}
+
+func readEntryArchiveMeta(r io.Reader) (EntryMeta, error) {
 	tr := tar.NewReader(bufio.NewReader(r))
 	var meta EntryMeta
 	seenMeta := false
@@ -1054,29 +1132,56 @@ func validateEntryArchive(r io.Reader, expectedTransactionID string) error {
 			break
 		}
 		if err != nil {
-			return err
+			return meta, err
 		}
 		if header.Name == "meta.json" {
 			if seenMeta {
-				return errors.New("entry contains duplicate metadata")
+				return meta, errors.New("entry contains duplicate metadata")
 			}
 			if err := json.NewDecoder(io.LimitReader(tr, header.Size)).Decode(&meta); err != nil {
-				return err
+				return meta, err
 			}
 			seenMeta = true
 			continue
 		}
 		if !safeArchivedObjectPath(header.Name) {
-			return fmt.Errorf("unexpected archive path %q", header.Name)
+			return meta, fmt.Errorf("unexpected archive path %q", header.Name)
 		}
 	}
 	if !seenMeta {
-		return errors.New("entry has no metadata")
+		return meta, errors.New("entry has no metadata")
 	}
-	if meta.TransactionID != expectedTransactionID {
-		return fmt.Errorf("transaction mismatch: got %s, want %s", meta.TransactionID, expectedTransactionID)
+	return meta, nil
+}
+
+func archivePayloadBytes(path string, blobs blobStore) (int64, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, err
 	}
-	return nil
+	defer file.Close()
+	tr := tar.NewReader(bufio.NewReader(file))
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return 0, errors.New("entry has no metadata")
+		}
+		if err != nil {
+			return 0, err
+		}
+		if header.Name != "meta.json" {
+			continue
+		}
+		var meta EntryMeta
+		if err := json.NewDecoder(io.LimitReader(tr, header.Size)).Decode(&meta); err != nil {
+			return 0, err
+		}
+		meta, err = resolveEntryMeta(meta, blobs)
+		if err != nil {
+			return 0, err
+		}
+		return objectBlobBytes(meta.Objects), nil
+	}
 }
 
 func validateCheckpointArchive(r io.Reader, expectedGeneration uint64) error {

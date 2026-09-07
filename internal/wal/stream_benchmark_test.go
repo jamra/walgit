@@ -14,8 +14,24 @@ import (
 )
 
 func BenchmarkS3StageFourMiB(b *testing.B) {
+	benchmarkS3StageFourMiB(b, false)
+}
+
+func BenchmarkS3StageFourMiBDualAuthority(b *testing.B) {
+	benchmarkS3StageFourMiB(b, true)
+}
+
+func benchmarkS3StageFourMiB(b *testing.B, dualAuthority bool) {
 	client := &discardPutS3{memoryS3: newMemoryS3()}
 	store := &S3Store{client: client, bucket: "bucket", prefix: "benchmark", timeout: time.Minute}
+	if dualAuthority {
+		secondaryClient := &discardPutS3{memoryS3: newMemoryS3()}
+		secondary := &S3Store{client: secondaryClient, bucket: "secondary", prefix: "benchmark", timeout: time.Minute}
+		store.blobs = replicatedBlobStore{stores: []blobStore{
+			s3BlobStore{store: store},
+			s3BlobStore{store: secondary},
+		}}
+	}
 	objects := filepath.Join(b.TempDir(), "objects")
 	if err := os.MkdirAll(filepath.Join(objects, "pack"), 0o755); err != nil {
 		b.Fatal(err)

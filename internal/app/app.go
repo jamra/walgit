@@ -400,7 +400,7 @@ func Benchmark(pushes, blobBytes int, keep bool, output io.Writer) error {
 	}
 	var walBytes int64
 	for _, entry := range preCompactionManifest.Entries {
-		walBytes += entry.Bytes
+		walBytes += entry.Bytes + entry.PayloadBytes
 	}
 	checkpointStarted := time.Now()
 	checkpoint, err := Compact(remote, store, "bench")
@@ -439,7 +439,7 @@ func Benchmark(pushes, blobBytes int, keep bool, output io.Writer) error {
 		WALRestoreMillis:        float64(restoreElapsed.Microseconds()) / 1000,
 		CheckpointCreateMillis:  float64(checkpointElapsed.Microseconds()) / 1000,
 		CheckpointRestoreMillis: float64(checkpointRestoreElapsed.Microseconds()) / 1000,
-		CheckpointBytes:         checkpoint.Bytes,
+		CheckpointBytes:         checkpoint.Bytes + checkpoint.PayloadBytes,
 		RemoteHead:              remoteHead,
 		RestoredHead:            restoredHead,
 	}

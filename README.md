@@ -12,10 +12,11 @@ dual-authority deployment needed for provider-loss durability are described in
 [the reliability model](docs/reliability.md).
 
 The filesystem backend provides a local correctness and performance baseline.
-The S3-compatible backend stores immutable transactions and checkpoints as
-objects. Stores that support conditional `PutObject` requests linearize
-manifest updates with ETag compare-and-swap; stores without that capability
-must put a single writer or external coordinator in front of each repository.
+The S3-compatible backend stores small transactions inline and splits object
+sets of 1 MiB or more into immutable, content-addressed chunks. Stores that
+support conditional `PutObject` requests linearize manifest updates with ETag
+compare-and-swap; stores without that capability must put a single writer or
+external coordinator in front of each repository.
 
 ## Build and benchmark
 
@@ -118,32 +119,85 @@ The bucket identity needs `GetObject`, `PutObject`, `HeadObject`,
 writes must be supported; a losing manifest writer receives a precondition
 failure, reloads the winner, and retries against the new ETag.
 
-WAL transactions and checkpoints are generated directly into a bounded
-stream while their SHA-256 digest is calculated from the same bytes. The
-normal S3 path therefore has no local temporary archive, no local `fsync`, and
-no complete-file reread. Uploads request S3's SHA-256 integrity check and
-compare a returned checksum when the provider supplies one. If an upload
-times out after the provider may have accepted it, walgit resolves the
-ambiguous result by reading and hashing the immutable object; it never
+Small WAL transactions and checkpoints are generated directly into a bounded
+stream while their SHA-256 digest is calculated from the same bytes. Object
+sets of 1 MiB or more use the blob path:
+
+```text
+Git quarantine file
+        │
+        ├── 8 MiB chunk ── SHA-256 ──┬──► primary blob authority
+        │                            └──► optional secondary authority
+        │
+        └── ordered chunk descriptor ───► tiny immutable WAL stub
+```
+
+At most four chunks upload concurrently, which bounds foreground chunk memory
+to 32 MiB per staged transaction. Chunks are stored by SHA-256 under
+`.walgit-blobs/sha256/<first-two-hex>/<digest>`, so retrying a partially
+completed upload reuses verified chunks and identical content is deduplicated
+within the store prefix. The complete transaction descriptor is itself a
+content-addressed blob. Existing inline WAL archives remain replayable.
+The on-disk format, publication sequence, configuration, recovery behavior,
+and GC constraints are detailed in [the blob-store design](docs/blob-store.md).
+
+Neither S3 path uses a local temporary archive or local `fsync`. Uploads ask
+S3 to validate SHA-256 and compare a returned checksum when the provider
+supplies one. If an upload times out after the provider may have accepted it,
+walgit reads and verifies the immutable object before continuing; it never
 blindly overwrites it. A restarted writer performs the same recovery when its
-in-memory staged-object metadata is absent.
+in-memory staged-object metadata is absent. Replay verifies every chunk and
+the reconstructed whole-file hash.
 
-The included `BenchmarkS3StageFourMiB` isolates archive construction and
-upload-body delivery with a 4 MiB pack and an in-memory S3 sink. Five runs on
-an Apple M1 Max measured the following; this intentionally excludes network
-latency and provider processing:
+To require every large payload and its descriptor to reach two independently
+configured blob stores before the WAL stub can be published:
 
-| S3 stage implementation | Mean time | Throughput | Allocated bytes | Allocations |
-| --- | ---: | ---: | ---: | ---: |
-| Temporary file + sync + two rereads | 13.80 ms | 304 MB/s | 74.5 KiB | 88 |
-| One-pass bounded stream | **2.66 ms** | **1,578 MB/s** | **43.5 KiB** | **80** |
+```sh
+export WALGIT_BLOB_SECONDARY_STORE=s3://independent-account/walgit-blobs
+export WALGIT_REQUIRE_BLOB_REPLICATION=true
+```
 
-That is a 5.2x improvement in the client-side stage path and 42% fewer
-allocated bytes. Run it on the target host with:
+The secondary uses the normal AWS configuration unless these overrides are
+set: `WALGIT_BLOB_SECONDARY_REGION`, `WALGIT_BLOB_SECONDARY_ENDPOINT`,
+`WALGIT_BLOB_SECONDARY_PATH_STYLE`,
+`WALGIT_BLOB_SECONDARY_ACCESS_KEY_ID`,
+`WALGIT_BLOB_SECONDARY_SECRET_ACCESS_KEY`, and
+`WALGIT_BLOB_SECONDARY_SESSION_TOKEN`. The same secondary can instead be a
+filesystem path or `file://` URI. A configured one-sided write fails the push;
+reads try the primary, verify the hash, and fall back to the secondary on a
+missing or corrupt chunk.
+
+This is deliberately only the dual-authority **blob data plane**. The current
+manifest and WAL stub remain in the primary store, so the option does not yet
+satisfy the stronger promise that an acknowledged repository survives total
+loss of the primary provider. That requires replicated, hash-chained commit
+certificates and a repair/scrub worker; see [the reliability model](docs/reliability.md).
+Blob garbage collection is also intentionally disabled until that worker can
+prove reachability and retention on both authorities. Use a separate store
+prefix per tenant or security domain; cross-tenant deduplication can leak
+whether content already exists.
+
+The included benchmarks isolate archive/blob construction and upload-body
+delivery with a 4 MiB pack and in-memory S3 sinks. Five runs on an Apple M1 Max
+measured the following; this intentionally excludes network latency, TLS, and
+provider processing:
+
+| S3 stage implementation | Mean time | Throughput | Allocations |
+| --- | ---: | ---: | ---: |
+| Historical temporary file + sync + two rereads | 13.80 ms | 304 MB/s | 88 |
+| Historical one-pass monolithic stream | **2.66 ms** | **1,578 MB/s** | 80 |
+| Content-addressed chunks, one authority | 4.17 ms | 1,005 MB/s | 157 |
+| Content-addressed chunks, two concurrent authorities | 4.29 ms | 977 MB/s | 207 |
+
+The current one-authority blob path is 3.3x faster than the original temporary
+archive path. Its extra whole-file/chunk hashing, descriptor, and requests cost
+about 57% relative to the simpler monolithic stream. Concurrent fanout added
+about 3% with memory sinks; over a real network, acknowledgement waits for the
+slower authority. Run both current variants on the target host with:
 
 ```sh
 go test ./internal/wal -run '^$' \
-  -bench BenchmarkS3StageFourMiB -benchmem -count 5
+  -bench 'BenchmarkS3StageFourMiB' -benchmem -count 5
 ```
 
 The [DigitalOcean Spaces API reference](https://docs.digitalocean.com/reference/api/spaces/)
@@ -374,6 +428,9 @@ reconstructs refs and objects from the latest checkpoint plus WAL tail.
 - Transient pack locks, keep files, and replay temporary files are never copied
   into WAL entries or checkpoints.
 - WAL and checkpoint contents are protected by SHA-256 checksums.
+- Large object sets use ordered 8 MiB content-addressed chunks plus a
+  whole-file checksum. With a secondary configured, both chunk authorities
+  must acknowledge every chunk and the external descriptor before publication.
 - Filesystem manifest publication uses an advisory lock plus atomic rename.
   File contents are synced before rename and the containing directory is
   synced afterward. A checkpoint directory is synced before a manifest may
@@ -410,15 +467,16 @@ DigitalOcean Spaces uses the included per-repository writer coordinator because
 its object API cannot perform the required manifest CAS. The coordinator does
 not yet have distributed leases or automatic primary failover, so operators
 must ensure that only one instance is active for a Spaces-backed repository.
-One S3 bucket is still one administrative failure domain. For a strict
-"no acknowledged data loss after losing a provider/account/region" policy,
-the deployment must acknowledge only after independently writing the same
-immutable transaction to two separately administered durable stores. That
-dual-authority commit protocol and its repair worker are not yet built into
-this prototype; ordinary provider replication, versioning, or RAID alone must
-not be described as satisfying that policy.
+One S3 bucket is still one administrative failure domain. Walgit's optional
+secondary blob store now requires large payload chunks and their descriptors
+to reach two authorities before publication, but manifests and commit ordering
+remain primary-only. The hash-chained dual-authority commit certificate and
+repair/scrub worker required for strict provider-loss durability are not yet
+built. Ordinary provider replication, versioning, or RAID alone must not be
+described as satisfying that policy.
 There is no built-in service discovery, rendezvous-hash router, gossip, or
-cache warming. The system also has no LFS integration, admission-control
+cache warming. The system also has no Git LFS protocol integration,
+admission-control
 quotas, or TLS termination. Scheduled maintenance is intentionally serialized
 with Git traffic per repository, so a large checkpoint can temporarily
 increase that repository's request latency.

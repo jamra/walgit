@@ -262,7 +262,7 @@ func BenchmarkNodesAtStore(nodes, pushes, blobBytes int, storeBase string, keep 
 	}
 	var walBytes int64
 	for _, entry := range manifest.Entries {
-		walBytes += entry.Bytes
+		walBytes += entry.Bytes + entry.PayloadBytes
 	}
 	byNode := make(map[string]latencySummary, nodes)
 	for i, samples := range perNodeSamples {

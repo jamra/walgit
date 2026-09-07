@@ -329,6 +329,67 @@ func TestS3StageStreamsWithoutLocalFileAndRequestsSHA256(t *testing.T) {
 	}
 }
 
+func TestS3BlobBackedStageStoresTinyWALAndReplays(t *testing.T) {
+	client := newMemoryS3()
+	store := &S3Store{client: client, bucket: "bucket", prefix: "walgit", timeout: time.Second}
+	if err := store.Initialize("repo", "refs/heads/main", "sha1"); err != nil {
+		t.Fatal(err)
+	}
+	objects := filepath.Join(t.TempDir(), "objects")
+	if err := os.MkdirAll(filepath.Join(objects, "pack"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("blob payload"), blobExternalizeThreshold/len("blob payload")+1)
+	payload = payload[:blobExternalizeThreshold]
+	if err := os.WriteFile(filepath.Join(objects, "pack", "objects.pack"), payload, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	updates := []RefUpdate{{Old: strings.Repeat("0", 40), New: strings.Repeat("a", 40), Ref: "refs/heads/main"}}
+	if err := store.Stage("repo", objects, updates); err != nil {
+		t.Fatal(err)
+	}
+
+	txID, err := transactionID(updates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transactionKey := store.key("repo", "transactions/"+txID+".wal")
+	client.mu.Lock()
+	transaction := client.objects[transactionKey]
+	var blobKeys []string
+	for key := range client.objects {
+		if strings.Contains(key, "/.walgit-blobs/sha256/") {
+			blobKeys = append(blobKeys, key)
+		}
+	}
+	client.mu.Unlock()
+	if len(transaction.data) >= len(payload)/100 {
+		t.Fatalf("blob-backed WAL is %d bytes for a %d-byte payload", len(transaction.data), len(payload))
+	}
+	if len(blobKeys) != 2 {
+		t.Fatalf("S3 stage stored %d blob objects, want one data chunk and one descriptor: %v", len(blobKeys), blobKeys)
+	}
+
+	entry, _, err := store.Commit("repo", updates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.PayloadBytes != int64(len(payload)) {
+		t.Fatalf("manifest payload bytes = %d, want %d", entry.PayloadBytes, len(payload))
+	}
+	replayed := filepath.Join(t.TempDir(), "objects")
+	if _, err := store.ReplayFrom("repo", 0, replayed, func(ManifestEntry, EntryMeta) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(replayed, "pack", "objects.pack"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("S3 blob-backed replay changed the object payload")
+	}
+}
+
 func TestAWSSDKAcceptsUnseekableStreamingArchive(t *testing.T) {
 	var received int64
 	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
