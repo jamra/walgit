@@ -116,8 +116,12 @@ func normalizeBlobLocation(location string) (string, error) {
 }
 
 func openSecondaryAuthority(location string) (durableAuthority, error) {
+	return openAuthority(location, true)
+}
+
+func openAuthority(location string, secondary bool) (durableAuthority, error) {
 	if strings.HasPrefix(location, "s3://") {
-		store, err := openS3Single(location, true)
+		store, err := openS3Single(location, secondary)
 		if err != nil {
 			return nil, err
 		}
@@ -138,4 +142,15 @@ func openSecondaryAuthority(location string) (durableAuthority, error) {
 		return nil, err
 	}
 	return filesystemBlobStore{store: Store{Root: root}}, nil
+}
+
+func openRepairAuthority(location string, secondary bool) (durableAuthority, error) {
+	if strings.HasPrefix(location, "s3://") {
+		store, err := openS3Repair(location, secondary)
+		if err != nil {
+			return nil, err
+		}
+		return s3BlobStore{store: store}, nil
+	}
+	return openAuthority(location, secondary)
 }

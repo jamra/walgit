@@ -122,17 +122,19 @@ mode already enabled. A production migration tool should create and certify a
 complete checkpoint on both authorities before lowering the recovery floor;
 that migration command is not implemented yet.
 
-## Remaining requirements
+## Operational requirements
 
 The foreground protocol prevents acknowledgement before two verified copies,
 but durability is also a continuing operational property:
 
 - enable independently administered retention or Object Lock;
 - deny overwrite and delete privileges to foreground writers;
-- continuously scrub every chain, descriptor, and chunk;
-- repair a damaged authority with separate audited credentials;
+- continuously run `walgit scrub` over every chain, descriptor, and chunk;
+- use `walgit repair` with separate audited credentials when one authority is
+  damaged; see the [scrub and repair runbook](scrub-repair.md);
 - stop writes and garbage collection when repair cannot prove a source;
 - restore regularly into an isolated account and run `git fsck --strict`.
 
 Certificate and content-addressed blob garbage collection remain disabled until
-dual-authority reachability, retention, and repair are implemented.
+dual-authority reachability and independently enforced retention are
+implemented.

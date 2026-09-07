@@ -125,8 +125,10 @@ choice.
 
 ## Remaining operational boundary
 
-The certificate protocol now preserves independently replayable ordering and
+The certificate protocol preserves independently replayable ordering and
 payloads across primary loss for repositories initialized in dual-authority
-mode. The next reliability milestone is continuous scrub/repair with privileged
-credentials, independently enforced retention, and recurring disaster-restore
-drills. See [the reliability model](reliability.md) for the exact boundary.
+mode. `walgit scrub` supports continuous verification of both copies, and
+`walgit repair` provides a conservative, separately credentialed repair path;
+see the [runbook](scrub-repair.md). Independently enforced retention and
+recurring disaster-restore drills remain required. See the
+[reliability model](reliability.md) for the exact boundary.

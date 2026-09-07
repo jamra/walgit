@@ -181,9 +181,12 @@ not make that statement timeless. The remaining operational protocol is:
 
 1. Enable versioning and retention/Object Lock independently on both sides,
    using credentials that cannot shorten retention or delete retained data.
-2. Continuously scrub both copies against the certificate chain.
-3. Use a separately privileged repair worker to copy and verify missing chunks,
-   descriptors, and certificate links before another failure can overlap.
+2. Continuously run `walgit scrub` against both copies and alert on any nonzero
+   result.
+3. Stop the repository writer and use `walgit repair` with separately
+   privileged credentials to copy and verify missing chunks, descriptors, and
+   certificate links before another failure can overlap. The exact procedure
+   is in the [scrub and repair runbook](scrub-repair.md).
 4. Exercise restoration in a separate account and run `git fsck --strict`.
 5. Add a certified checkpoint migration before claiming full-history protection
    for a repository anchored above generation zero.

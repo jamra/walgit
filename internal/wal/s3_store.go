@@ -191,6 +191,14 @@ func OpenS3(location string) (Backend, error) {
 }
 
 func openS3Single(location string, secondary bool) (*S3Store, error) {
+	return openS3Configured(location, secondary, false)
+}
+
+func openS3Repair(location string, secondary bool) (*S3Store, error) {
+	return openS3Configured(location, secondary, true)
+}
+
+func openS3Configured(location string, secondary, repair bool) (*S3Store, error) {
 	withoutScheme := strings.TrimPrefix(location, "s3://")
 	bucket, prefix, _ := strings.Cut(withoutScheme, "/")
 	if bucket == "" {
@@ -222,6 +230,21 @@ func openS3Single(location string, secondary bool) (*S3Store, error) {
 				accessKey, secretKey, os.Getenv("WALGIT_BLOB_SECONDARY_SESSION_TOKEN"),
 			)))
 		}
+	}
+	if repair {
+		role := "PRIMARY"
+		if secondary {
+			role = "SECONDARY"
+		}
+		prefix := "WALGIT_REPAIR_" + role + "_"
+		accessKey := os.Getenv(prefix + "ACCESS_KEY_ID")
+		secretKey := os.Getenv(prefix + "SECRET_ACCESS_KEY")
+		if accessKey == "" || secretKey == "" {
+			return nil, fmt.Errorf("S3 repair requires %sACCESS_KEY_ID and %sSECRET_ACCESS_KEY", prefix, prefix)
+		}
+		options = append(options, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+			accessKey, secretKey, os.Getenv(prefix+"SESSION_TOKEN"),
+		)))
 	}
 	if region != "" {
 		options = append(options, config.WithRegion(region))

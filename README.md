@@ -9,7 +9,8 @@ Licensed under the [MIT License](LICENSE).
 
 The enforced crash-safety guarantees, failure behavior, and stronger
 dual-authority deployment needed for provider-loss durability are described in
-[the reliability model](docs/reliability.md).
+[the reliability model](docs/reliability.md). Continuous integrity verification
+and conservative recovery are covered by the [scrub and repair runbook](docs/scrub-repair.md).
 
 The filesystem backend provides a local correctness and performance baseline.
 The S3-compatible backend stores small transactions inline and splits object
@@ -93,6 +94,20 @@ A cache can also be reconciled or reconstructed explicitly:
 walgit reconcile -repo /srv/git/origin.git -store /srv/walgit -id origin
 walgit restore -repo /srv/git/restored.git -store /srv/walgit -id origin
 ```
+
+Dual-authority repositories can be verified and conservatively repaired with
+machine-readable commands. Repair requires an explicit, fully verified source:
+
+```sh
+export WALGIT_BLOB_SECONDARY_STORE=/mnt/independent-b/walgit
+walgit scrub -store /mnt/independent-a/walgit -id origin
+walgit repair -store /mnt/independent-a/walgit -id origin -source primary
+```
+
+For S3, repair additionally requires the dedicated
+`WALGIT_REPAIR_PRIMARY_*` and `WALGIT_REPAIR_SECONDARY_*` credentials described
+in the [runbook](docs/scrub-repair.md). Stop the repository writer throughout
+repair.
 
 ## S3-compatible storage
 
@@ -499,11 +514,14 @@ must ensure that only one instance is active for a Spaces-backed repository.
 One S3 bucket is still one administrative failure domain. With
 `WALGIT_REQUIRE_DUAL_AUTHORITY`, new repositories retain independently
 replayable data and hash-chained ordering in both authorities and can recover
-after complete primary-manifest/WAL/blob loss. The remaining operational gap is
-continuous privileged scrub/repair plus independently enforced retention or
-Object Lock. Without those controls, undetected deletion on one authority
-followed by loss of the other can still defeat the guarantee. Ordinary provider
-replication, versioning, or RAID alone must not be described as equivalent.
+after complete primary-manifest/WAL/blob loss. `walgit scrub` now verifies both
+complete copies, and `walgit repair` restores a damaged peer from an explicitly
+selected healthy source using a separately credentialed, audited path. The
+remaining operational gap is independently enforced retention or Object Lock
+and automatic scheduling/alerting. Without those controls, undetected deletion
+on one authority followed by loss of the other can still defeat the guarantee.
+Ordinary provider replication, versioning, or RAID alone must not be described
+as equivalent.
 There is no built-in service discovery, rendezvous-hash router, gossip, or
 cache warming. The system also has no Git LFS protocol integration,
 admission-control

@@ -82,6 +82,27 @@ func main() {
 		if err == nil {
 			err = json.NewEncoder(os.Stdout).Encode(result)
 		}
+	case "scrub":
+		fs := flag.NewFlagSet("scrub", flag.ExitOnError)
+		store := fs.String("store", "", "path or s3:// URI for the primary durable authority")
+		id := fs.String("id", "", "repository ID")
+		_ = fs.Parse(os.Args[2:])
+		var report any
+		report, err = app.Scrub(*store, *id)
+		if encodeErr := json.NewEncoder(os.Stdout).Encode(report); encodeErr != nil && err == nil {
+			err = encodeErr
+		}
+	case "repair":
+		fs := flag.NewFlagSet("repair", flag.ExitOnError)
+		store := fs.String("store", "", "path or s3:// URI for the primary durable authority")
+		id := fs.String("id", "", "repository ID")
+		source := fs.String("source", "", "verified source authority: primary or secondary")
+		_ = fs.Parse(os.Args[2:])
+		var report any
+		report, err = app.Repair(*store, *id, *source)
+		if encodeErr := json.NewEncoder(os.Stdout).Encode(report); encodeErr != nil && err == nil {
+			err = encodeErr
+		}
 	case "serve":
 		fs := flag.NewFlagSet("serve", flag.ExitOnError)
 		listen := fs.String("listen", "127.0.0.1:8080", "HTTP listen address")
@@ -150,5 +171,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: walgit <init|hook|restore|reconcile|gateway|compact|gc|serve|writer|bench> [options]")
+	fmt.Fprintln(os.Stderr, "usage: walgit <init|hook|restore|reconcile|gateway|compact|gc|scrub|repair|serve|writer|bench> [options]")
 }
