@@ -54,6 +54,16 @@ func Init(repo, store, id string) error {
 	if err := run("", "git", "-C", absRepo, "config", "maintenance.auto", "false"); err != nil {
 		return err
 	}
+	// A generation marker is only useful if Git's corresponding objects and
+	// references survive the same crash. Force real fsync semantics (including
+	// on macOS, where Git may otherwise select writeout-only) for data Git has
+	// committed before walgit persists that marker.
+	if err := run("", "git", "-C", absRepo, "config", "core.fsync", "committed"); err != nil {
+		return err
+	}
+	if err := run("", "git", "-C", absRepo, "config", "core.fsyncMethod", "fsync"); err != nil {
+		return err
+	}
 	if err := run("", "git", "-C", absRepo, "config", "http.receivepack", "true"); err != nil {
 		return err
 	}

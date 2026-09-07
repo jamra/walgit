@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -294,6 +295,76 @@ func TestReplayAtomicallyReplacesPartialObjectAndSkipsTransientFiles(t *testing.
 		if _, err := os.Stat(filepath.Join(destination, "pack", name)); !os.IsNotExist(err) {
 			t.Fatalf("transient file %s was replayed: %v", name, err)
 		}
+	}
+}
+
+func TestPersistenceFailurePoisonsFilesystemStore(t *testing.T) {
+	store, id, objects, updates := testTransaction(t)
+	syncCalls := 0
+	store.faults = &storeFaults{syncFile: func(*os.File) error {
+		syncCalls++
+		return errors.New("injected writeback EIO")
+	}}
+	if err := store.Stage(id, objects, updates); err == nil || !strings.Contains(err.Error(), "poisoned") {
+		t.Fatalf("expected a poisoning persistence failure, got %v", err)
+	}
+	if syncCalls != 1 {
+		t.Fatalf("sync called %d times, want 1", syncCalls)
+	}
+
+	// Simulate fsyncgate's dangerous second phase: a later fsync would report
+	// success. The store must remain unavailable instead of retrying it.
+	store.faults.syncFile = func(*os.File) error {
+		syncCalls++
+		return nil
+	}
+	if err := store.Stage(id, objects, updates); err == nil || !strings.Contains(err.Error(), "poisoned") {
+		t.Fatalf("poisoned store accepted a later operation: %v", err)
+	}
+	if syncCalls != 1 {
+		t.Fatalf("poisoned store retried fsync; calls=%d", syncCalls)
+	}
+	if _, err := store.Load(id); err == nil || !strings.Contains(err.Error(), "poisoned") {
+		t.Fatalf("poisoned store remained readable: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(store.Root, ".walgit-poisoned")); err != nil {
+		t.Fatalf("persistent poison sentinel missing: %v", err)
+	}
+}
+
+func TestMissingStagedTransactionDoesNotPoisonFilesystemStore(t *testing.T) {
+	store, id, _, updates := testTransaction(t)
+	if _, _, err := store.Commit(id, updates); err == nil {
+		t.Fatal("commit without a staged transaction succeeded")
+	}
+	if _, err := store.Load(id); err != nil {
+		t.Fatalf("logical transaction error poisoned healthy storage: %v", err)
+	}
+}
+
+func TestCheckpointDirectoryIsSyncedBeforeManifestPublication(t *testing.T) {
+	store, id, objects, updates := testTransaction(t)
+	if err := store.Stage(id, objects, updates); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Commit(id, updates); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Finalize(id, updates); err != nil {
+		t.Fatal(err)
+	}
+	var synced []string
+	store.faults = &storeFaults{syncDir: func(path string) error {
+		synced = append(synced, filepath.Clean(path))
+		return nil
+	}}
+	if _, err := store.CreateCheckpoint(id, objects, 1); err != nil {
+		t.Fatal(err)
+	}
+	checkpointDir := filepath.Join(store.Root, id, "checkpoints")
+	repoDir := filepath.Join(store.Root, id)
+	if len(synced) < 2 || synced[0] != checkpointDir || synced[len(synced)-1] != repoDir {
+		t.Fatalf("unexpected directory sync order: %v", synced)
 	}
 }
 

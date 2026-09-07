@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -72,7 +73,24 @@ type Manifest struct {
 	Prepared     map[string]PreparedTransaction `json:"prepared,omitempty"`
 }
 
-type Store struct{ Root string }
+type Store struct {
+	Root   string
+	faults *storeFaults
+}
+
+type storeFaults struct {
+	syncFile func(*os.File) error
+	syncDir  func(string) error
+}
+
+var poisonedStores sync.Map
+
+var archiveBufferPool = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, 256<<10)
+		return &buffer
+	},
+}
 
 type GCResult struct {
 	Pending     int `json:"pending"`
@@ -99,6 +117,9 @@ func cloneManifest(m Manifest) Manifest {
 }
 
 func (s Store) Initialize(repoID, head, objectFormat string) error {
+	if err := s.checkHealthy(); err != nil {
+		return err
+	}
 	if err := validateID(repoID); err != nil {
 		return err
 	}
@@ -121,14 +142,17 @@ func (s Store) Initialize(repoID, head, objectFormat string) error {
 			return err
 		}
 		m := Manifest{Version: manifestVersion, Head: head, ObjectFormat: objectFormat, Refs: map[string]string{}}
-		if err := writeManifest(dir, m); err != nil {
+		if err := s.writeManifest(dir, m); err != nil {
 			return err
 		}
-		return syncDir(dir)
+		return s.syncDirectory(dir, "initialize manifest directory")
 	})
 }
 
 func (s Store) Stage(repoID, objectDir string, updates []RefUpdate) error {
+	if err := s.checkHealthy(); err != nil {
+		return err
+	}
 	if err := validateID(repoID); err != nil {
 		return err
 	}
@@ -147,24 +171,24 @@ func (s Store) Stage(repoID, objectDir string, updates []RefUpdate) error {
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	meta := EntryMeta{TransactionID: txID, CreatedAt: time.Now().UTC(), Updates: updates}
-	if err := writeArchive(tmp, meta, objectDir); err != nil {
+	if err := writeArchive(&durabilityWriter{store: s, writer: tmp, operation: "write staged WAL"}, meta, objectDir); err != nil {
 		tmp.Close()
 		return err
 	}
-	if err := tmp.Sync(); err != nil {
+	if err := s.syncFile(tmp, "sync staged WAL"); err != nil {
 		tmp.Close()
 		return err
 	}
-	if err := tmp.Close(); err != nil {
+	if err := s.closeFile(tmp, "close staged WAL"); err != nil {
 		return err
 	}
 	if err := failpoint("stage.after_sync"); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpName, filepath.Join(pending, txID+".wal")); err != nil {
+	if err := s.rename(tmpName, filepath.Join(pending, txID+".wal"), "publish staged WAL"); err != nil {
 		return err
 	}
-	return syncDir(pending)
+	return s.syncDirectory(pending, "sync staged WAL directory")
 }
 
 func (s Store) Commit(repoID string, updates []RefUpdate) (ManifestEntry, Manifest, error) {
@@ -206,7 +230,7 @@ func (s Store) Commit(repoID string, updates []RefUpdate) (ManifestEntry, Manife
 		finalPath := filepath.Join(dir, name)
 		pendingPath := filepath.Join(dir, "pending", txID+".wal")
 		if _, err := os.Stat(finalPath); errors.Is(err, os.ErrNotExist) {
-			if err := os.Rename(pendingPath, finalPath); err != nil {
+			if err := s.rename(pendingPath, finalPath, "publish committed WAL"); err != nil {
 				return fmt.Errorf("publish staged transaction: %w", err)
 			}
 		} else if err != nil {
@@ -233,10 +257,10 @@ func (s Store) Commit(repoID string, updates []RefUpdate) (ManifestEntry, Manife
 			m.Prepared = make(map[string]PreparedTransaction)
 		}
 		m.Prepared[txID] = PreparedTransaction{TransactionID: txID, Generation: generation, CreatedAt: time.Now().UTC(), Updates: updates}
-		if err := writeManifest(dir, m); err != nil {
+		if err := s.writeManifest(dir, m); err != nil {
 			return err
 		}
-		if err := syncDir(dir); err != nil {
+		if err := s.syncDirectory(dir, "sync committed WAL and manifest directory"); err != nil {
 			return err
 		}
 		committed, result = entry, m
@@ -263,10 +287,10 @@ func (s Store) Finalize(repoID string, updates []RefUpdate) error {
 			return err
 		}
 		delete(m.Prepared, txID)
-		if err := writeManifest(dir, m); err != nil {
+		if err := s.writeManifest(dir, m); err != nil {
 			return err
 		}
-		if err := syncDir(dir); err != nil {
+		if err := s.syncDirectory(dir, "sync finalized manifest directory"); err != nil {
 			return err
 		}
 		return failpoint("finalize.after_manifest")
@@ -291,10 +315,10 @@ func (s Store) Abort(repoID string, updates []RefUpdate) error {
 		before, after := transactionState(m, updates)
 		if before {
 			delete(m.Prepared, txID)
-			if err := writeManifest(dir, m); err != nil {
+			if err := s.writeManifest(dir, m); err != nil {
 				return err
 			}
-			return syncDir(dir)
+			return s.syncDirectory(dir, "sync aborted manifest directory")
 		}
 		if !after {
 			return fmt.Errorf("cannot roll back prepared transaction %s because a touched ref advanced", txID)
@@ -312,18 +336,18 @@ func (s Store) Abort(repoID string, updates []RefUpdate) error {
 			tmpName := tmp.Name()
 			defer os.Remove(tmpName)
 			meta := EntryMeta{TransactionID: rollbackID, CreatedAt: time.Now().UTC(), Updates: inverse}
-			if err := writeMetadataArchive(tmp, meta); err != nil {
+			if err := writeMetadataArchive(&durabilityWriter{store: s, writer: tmp, operation: "write rollback WAL"}, meta); err != nil {
 				tmp.Close()
 				return err
 			}
-			if err := tmp.Sync(); err != nil {
+			if err := s.syncFile(tmp, "sync rollback WAL"); err != nil {
 				tmp.Close()
 				return err
 			}
-			if err := tmp.Close(); err != nil {
+			if err := s.closeFile(tmp, "close rollback WAL"); err != nil {
 				return err
 			}
-			if err := os.Rename(tmpName, finalPath); err != nil {
+			if err := s.rename(tmpName, finalPath, "publish rollback WAL"); err != nil {
 				return err
 			}
 		} else if err != nil {
@@ -348,10 +372,10 @@ func (s Store) Abort(repoID string, updates []RefUpdate) error {
 			Generation: generation, TransactionID: rollbackID, File: name, SHA256: digest, Bytes: size,
 		})
 		delete(m.Prepared, txID)
-		if err := writeManifest(dir, m); err != nil {
+		if err := s.writeManifest(dir, m); err != nil {
 			return err
 		}
-		if err := syncDir(dir); err != nil {
+		if err := s.syncDirectory(dir, "sync rollback WAL and manifest directory"); err != nil {
 			return err
 		}
 		return failpoint("rollback.after_manifest")
@@ -359,6 +383,9 @@ func (s Store) Abort(repoID string, updates []RefUpdate) error {
 }
 
 func (s Store) Load(repoID string) (Manifest, error) {
+	if err := s.checkHealthy(); err != nil {
+		return Manifest{}, err
+	}
 	if err := validateID(repoID); err != nil {
 		return Manifest{}, err
 	}
@@ -405,6 +432,9 @@ func (s Store) ReplayFrom(repoID string, generation uint64, gitObjects string, a
 }
 
 func (s Store) CreateCheckpoint(repoID, gitObjects string, expectedGeneration uint64) (Checkpoint, error) {
+	if err := s.checkHealthy(); err != nil {
+		return Checkpoint{}, err
+	}
 	m, err := s.Load(repoID)
 	if err != nil {
 		return Checkpoint{}, err
@@ -430,15 +460,15 @@ func (s Store) CreateCheckpoint(repoID, gitObjects string, expectedGeneration ui
 		Generation: m.Generation, CreatedAt: time.Now().UTC(), Head: m.Head,
 		ObjectFormat: m.ObjectFormat, Refs: cloneRefs(m.Refs),
 	}
-	if err := writeCheckpointArchive(tmp, meta, gitObjects); err != nil {
+	if err := writeCheckpointArchive(&durabilityWriter{store: s, writer: tmp, operation: "write checkpoint"}, meta, gitObjects); err != nil {
 		tmp.Close()
 		return Checkpoint{}, err
 	}
-	if err := tmp.Sync(); err != nil {
+	if err := s.syncFile(tmp, "sync checkpoint"); err != nil {
 		tmp.Close()
 		return Checkpoint{}, err
 	}
-	if err := tmp.Close(); err != nil {
+	if err := s.closeFile(tmp, "close checkpoint"); err != nil {
 		return Checkpoint{}, err
 	}
 	digest, size, err := fileDigest(tmpName)
@@ -447,7 +477,12 @@ func (s Store) CreateCheckpoint(repoID, gitObjects string, expectedGeneration ui
 	}
 	name := fmt.Sprintf("%020d-%s.checkpoint", m.Generation, digest[:16])
 	finalPath := filepath.Join(checkpointDir, name)
-	if err := os.Rename(tmpName, finalPath); err != nil {
+	if err := s.rename(tmpName, finalPath, "publish checkpoint"); err != nil {
+		return Checkpoint{}, err
+	}
+	// The checkpoint's directory entry must reach stable storage before a
+	// durable manifest is allowed to reference it.
+	if err := s.syncDirectory(checkpointDir, "sync checkpoint directory"); err != nil {
 		return Checkpoint{}, err
 	}
 	checkpoint := Checkpoint{Generation: m.Generation, File: filepath.ToSlash(filepath.Join("checkpoints", name)), SHA256: digest, Bytes: size}
@@ -468,10 +503,10 @@ func (s Store) CreateCheckpoint(repoID, gitObjects string, expectedGeneration ui
 			}
 		}
 		latest.Entries = kept
-		if err := writeManifest(dir, latest); err != nil {
+		if err := s.writeManifest(dir, latest); err != nil {
 			return err
 		}
-		return syncDir(dir)
+		return s.syncDirectory(dir, "sync checkpoint manifest directory")
 	})
 	return checkpoint, err
 }
@@ -596,6 +631,9 @@ func (s Store) GarbageCollect(repoID string, olderThan time.Time) (GCResult, err
 }
 
 func (s Store) withLock(repoID string, fn func() error) error {
+	if err := s.checkHealthy(); err != nil {
+		return err
+	}
 	dir := filepath.Join(s.Root, repoID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -702,7 +740,7 @@ func readManifest(dir string) (Manifest, error) {
 	return m, nil
 }
 
-func writeManifest(dir string, m Manifest) error {
+func (s Store) writeManifest(dir string, m Manifest) error {
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
@@ -714,18 +752,124 @@ func writeManifest(dir string, m Manifest) error {
 	}
 	name := tmp.Name()
 	defer os.Remove(name)
-	if _, err := tmp.Write(data); err != nil {
+	if _, err := (&durabilityWriter{store: s, writer: tmp, operation: "write manifest"}).Write(data); err != nil {
 		tmp.Close()
 		return err
 	}
-	if err := tmp.Sync(); err != nil {
+	if err := s.syncFile(tmp, "sync manifest"); err != nil {
 		tmp.Close()
 		return err
 	}
-	if err := tmp.Close(); err != nil {
+	if err := s.closeFile(tmp, "close manifest"); err != nil {
 		return err
 	}
-	return os.Rename(name, filepath.Join(dir, "manifest.json"))
+	return s.rename(name, filepath.Join(dir, "manifest.json"), "publish manifest")
+}
+
+type durabilityWriter struct {
+	store     Store
+	writer    io.Writer
+	operation string
+}
+
+func (w *durabilityWriter) Write(data []byte) (int, error) {
+	n, err := w.writer.Write(data)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		return n, w.store.poison(w.operation, err)
+	}
+	return n, nil
+}
+
+func (s Store) checkHealthy() error {
+	root := filepath.Clean(s.Root)
+	if cause, ok := poisonedStores.Load(root); ok {
+		return fmt.Errorf("WAL store is poisoned after a persistence failure: %v", cause)
+	}
+	data, err := os.ReadFile(filepath.Join(root, ".walgit-poisoned"))
+	if err == nil {
+		cause := strings.TrimSpace(string(data))
+		if cause == "" {
+			cause = "unknown persistence failure"
+		}
+		poisonedStores.Store(root, cause)
+		return fmt.Errorf("WAL store is poisoned after a persistence failure: %s", cause)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("check WAL store health: %w", err)
+	}
+	return nil
+}
+
+func (s Store) poison(operation string, cause error) error {
+	poisoned := fmt.Errorf("%s: %w", operation, cause)
+	root := filepath.Clean(s.Root)
+	poisonedStores.Store(root, poisoned)
+
+	// This sentinel makes independent hook processes fail closed too. It is
+	// best-effort because the same filesystem has just reported that it cannot
+	// be trusted. Operators must recover/verify the store before removing it.
+	if err := os.MkdirAll(root, 0o755); err == nil {
+		path := filepath.Join(root, ".walgit-poisoned")
+		if f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600); err == nil {
+			_, _ = fmt.Fprintf(f, "%s\n", poisoned)
+			_ = f.Sync()
+			_ = f.Close()
+			_ = syncDir(root)
+		}
+	}
+	return fmt.Errorf("WAL store poisoned after persistence failure: %w", poisoned)
+}
+
+func (s Store) syncFile(file *os.File, operation string) error {
+	var err error
+	if s.faults != nil && s.faults.syncFile != nil {
+		err = s.faults.syncFile(file)
+	} else {
+		err = file.Sync()
+	}
+	if err != nil {
+		return s.poison(operation, err)
+	}
+	return nil
+}
+
+func (s Store) closeFile(file *os.File, operation string) error {
+	if err := file.Close(); err != nil {
+		return s.poison(operation, err)
+	}
+	return nil
+}
+
+func (s Store) rename(oldPath, newPath, operation string) error {
+	if err := os.Rename(oldPath, newPath); err != nil {
+		if isPersistenceFailure(err) {
+			return s.poison(operation, err)
+		}
+		return fmt.Errorf("%s: %w", operation, err)
+	}
+	return nil
+}
+
+func isPersistenceFailure(err error) bool {
+	return errors.Is(err, syscall.EIO) || errors.Is(err, syscall.ENOSPC) ||
+		errors.Is(err, syscall.EDQUOT) || errors.Is(err, syscall.EROFS) ||
+		errors.Is(err, syscall.ENODEV) || errors.Is(err, syscall.ESTALE)
+}
+
+func (s Store) syncDirectory(path, operation string) error {
+	var err error
+	if s.faults != nil && s.faults.syncDir != nil {
+		err = s.faults.syncDir(path)
+	} else {
+		err = syncDir(path)
+	}
+	if err != nil {
+		return s.poison(operation, err)
+	}
+	return nil
 }
 
 func writeArchive(w io.Writer, meta EntryMeta, objectDir string) error {
@@ -810,7 +954,9 @@ func writeObjectFiles(tw *tar.Writer, objectDir string) error {
 		if err != nil {
 			return err
 		}
-		_, copyErr := io.Copy(tw, f)
+		buffer := archiveBufferPool.Get().(*[]byte)
+		_, copyErr := io.CopyBuffer(tw, f, *buffer)
+		archiveBufferPool.Put(buffer)
 		closeErr := f.Close()
 		if copyErr != nil {
 			return copyErr
@@ -826,6 +972,7 @@ func readArchive(r io.Reader, objectDir string) (EntryMeta, error) {
 	tr := tar.NewReader(bufio.NewReader(r))
 	var meta EntryMeta
 	seenMeta := false
+	touched := make(map[string]bool)
 	for {
 		h, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -844,12 +991,17 @@ func readArchive(r io.Reader, objectDir string) (EntryMeta, error) {
 		if !strings.HasPrefix(h.Name, "objects/") {
 			return meta, fmt.Errorf("unexpected archive path %q", h.Name)
 		}
-		if err := extractObject(tr, h.Name, objectDir); err != nil {
+		directory, err := extractObject(tr, h.Name, objectDir)
+		if err != nil {
 			return meta, err
 		}
+		touched[directory] = true
 	}
 	if !seenMeta {
 		return meta, errors.New("entry has no metadata")
+	}
+	if err := syncObjectDirectories(objectDir, touched); err != nil {
+		return meta, fmt.Errorf("make replayed objects durable: %w", err)
 	}
 	return meta, nil
 }
@@ -858,6 +1010,7 @@ func readCheckpointArchive(r io.Reader, objectDir string) (CheckpointMeta, error
 	tr := tar.NewReader(bufio.NewReader(r))
 	var meta CheckpointMeta
 	seenMeta := false
+	touched := make(map[string]bool)
 	for {
 		h, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -876,49 +1029,166 @@ func readCheckpointArchive(r io.Reader, objectDir string) (CheckpointMeta, error
 		if !strings.HasPrefix(h.Name, "objects/") {
 			return meta, fmt.Errorf("unexpected checkpoint path %q", h.Name)
 		}
-		if err := extractObject(tr, h.Name, objectDir); err != nil {
+		directory, err := extractObject(tr, h.Name, objectDir)
+		if err != nil {
 			return meta, err
 		}
+		touched[directory] = true
 	}
 	if !seenMeta {
 		return meta, errors.New("checkpoint has no metadata")
 	}
+	if err := syncObjectDirectories(objectDir, touched); err != nil {
+		return meta, fmt.Errorf("make restored checkpoint objects durable: %w", err)
+	}
 	return meta, nil
 }
 
-func extractObject(r io.Reader, archiveName, objectDir string) error {
+func validateEntryArchive(r io.Reader, expectedTransactionID string) error {
+	tr := tar.NewReader(bufio.NewReader(r))
+	var meta EntryMeta
+	seenMeta := false
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if header.Name == "meta.json" {
+			if seenMeta {
+				return errors.New("entry contains duplicate metadata")
+			}
+			if err := json.NewDecoder(io.LimitReader(tr, header.Size)).Decode(&meta); err != nil {
+				return err
+			}
+			seenMeta = true
+			continue
+		}
+		if !safeArchivedObjectPath(header.Name) {
+			return fmt.Errorf("unexpected archive path %q", header.Name)
+		}
+	}
+	if !seenMeta {
+		return errors.New("entry has no metadata")
+	}
+	if meta.TransactionID != expectedTransactionID {
+		return fmt.Errorf("transaction mismatch: got %s, want %s", meta.TransactionID, expectedTransactionID)
+	}
+	return nil
+}
+
+func validateCheckpointArchive(r io.Reader, expectedGeneration uint64) error {
+	tr := tar.NewReader(bufio.NewReader(r))
+	var meta CheckpointMeta
+	seenMeta := false
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if header.Name == "checkpoint.json" {
+			if seenMeta {
+				return errors.New("checkpoint contains duplicate metadata")
+			}
+			if err := json.NewDecoder(io.LimitReader(tr, header.Size)).Decode(&meta); err != nil {
+				return err
+			}
+			seenMeta = true
+			continue
+		}
+		if !safeArchivedObjectPath(header.Name) {
+			return fmt.Errorf("unexpected checkpoint path %q", header.Name)
+		}
+	}
+	if !seenMeta {
+		return errors.New("checkpoint has no metadata")
+	}
+	if meta.Generation != expectedGeneration {
+		return fmt.Errorf("checkpoint generation mismatch: got %d, want %d", meta.Generation, expectedGeneration)
+	}
+	return nil
+}
+
+func safeArchivedObjectPath(name string) bool {
+	if !strings.HasPrefix(name, "objects/") {
+		return false
+	}
+	rel := strings.TrimPrefix(name, "objects/")
+	clean := filepath.Clean(filepath.FromSlash(rel))
+	return clean != "." && !filepath.IsAbs(clean) && clean != ".." && !strings.HasPrefix(clean, ".."+string(filepath.Separator))
+}
+
+func extractObject(r io.Reader, archiveName, objectDir string) (string, error) {
 	rel := strings.TrimPrefix(archiveName, "objects/")
 	clean := filepath.Clean(filepath.FromSlash(rel))
 	if clean == "." || filepath.IsAbs(clean) || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("unsafe archive path %q", archiveName)
+		return "", fmt.Errorf("unsafe archive path %q", archiveName)
 	}
 	directory := filepath.Join(objectDir, filepath.Dir(clean))
 	if err := os.MkdirAll(directory, 0o755); err != nil {
-		return err
+		return "", err
 	}
 	tmp, err := os.CreateTemp(directory, ".walgit-object-*.tmp")
 	if err != nil {
-		return err
+		return "", err
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	_, copyErr := io.Copy(tmp, r)
 	if copyErr != nil {
 		tmp.Close()
-		return copyErr
+		return "", copyErr
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		return err
+		return "", err
 	}
 	if err := tmp.Chmod(0o444); err != nil {
 		tmp.Close()
-		return err
+		return "", err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return "", err
 	}
-	return os.Rename(tmpName, filepath.Join(objectDir, clean))
+	if err := os.Rename(tmpName, filepath.Join(objectDir, clean)); err != nil {
+		return "", err
+	}
+	return directory, nil
+}
+
+func syncObjectDirectories(objectDir string, touched map[string]bool) error {
+	root := filepath.Clean(objectDir)
+	directories := make(map[string]bool, len(touched)+1)
+	for directory := range touched {
+		for current := filepath.Clean(directory); ; current = filepath.Dir(current) {
+			directories[current] = true
+			if current == root {
+				break
+			}
+			parent := filepath.Dir(current)
+			if parent == current || !strings.HasPrefix(current+string(filepath.Separator), root+string(filepath.Separator)) {
+				return fmt.Errorf("object directory %q escapes %q", directory, root)
+			}
+		}
+	}
+	ordered := make([]string, 0, len(directories))
+	for directory := range directories {
+		ordered = append(ordered, directory)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		return strings.Count(ordered[i], string(filepath.Separator)) > strings.Count(ordered[j], string(filepath.Separator))
+	})
+	for _, directory := range ordered {
+		if err := syncDir(directory); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func transientObjectFile(path string) bool {

@@ -5,7 +5,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -295,6 +299,182 @@ func TestS3ConcurrentCommitsUseManifestCAS(t *testing.T) {
 	if m.Generation != writers || len(m.Refs) != writers {
 		t.Fatalf("S3 CAS lost updates: %#v", m)
 	}
+}
+
+func TestS3StageStreamsWithoutLocalFileAndRequestsSHA256(t *testing.T) {
+	client := &observingS3{memoryS3: newMemoryS3()}
+	store := &S3Store{client: client, bucket: "bucket", prefix: "walgit", timeout: time.Second}
+	if err := store.Initialize("repo", "refs/heads/main", "sha1"); err != nil {
+		t.Fatal(err)
+	}
+	objects := filepath.Join(t.TempDir(), "objects")
+	if err := os.MkdirAll(filepath.Join(objects, "pack"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(objects, "pack", "objects.pack"), bytes.Repeat([]byte("x"), 1<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	updates := []RefUpdate{{Old: strings.Repeat("0", 40), New: strings.Repeat("a", 40), Ref: "refs/heads/main"}}
+	if err := store.Stage("repo", objects, updates); err != nil {
+		t.Fatal(err)
+	}
+	if client.transactionBodyWasFile {
+		t.Fatal("transaction upload used an os.File instead of the streaming pipe")
+	}
+	if client.transactionContentLengthSet {
+		t.Fatal("transaction upload unexpectedly required a precomputed content length")
+	}
+	if client.transactionChecksum != types.ChecksumAlgorithmSha256 {
+		t.Fatalf("checksum algorithm = %q, want SHA256", client.transactionChecksum)
+	}
+}
+
+func TestAWSSDKAcceptsUnseekableStreamingArchive(t *testing.T) {
+	var received int64
+	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPut {
+			http.Error(response, "unexpected method", http.StatusMethodNotAllowed)
+			return
+		}
+		var err error
+		received, err = io.Copy(io.Discard, request.Body)
+		if err != nil {
+			http.Error(response, err.Error(), http.StatusBadRequest)
+			return
+		}
+		response.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	client := s3.NewFromConfig(aws.Config{
+		Region:      "us-east-1",
+		Credentials: aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider("test", "test", "")),
+		HTTPClient:  server.Client(),
+	}, func(options *s3.Options) {
+		options.BaseEndpoint = aws.String(server.URL)
+		options.UsePathStyle = true
+	})
+	store := &S3Store{client: client, bucket: "bucket", prefix: "walgit", timeout: 5 * time.Second}
+	updates := []RefUpdate{{Old: strings.Repeat("0", 40), New: strings.Repeat("a", 40), Ref: "refs/heads/main"}}
+	if err := store.Stage("repo", t.TempDir(), updates); err != nil {
+		t.Fatalf("AWS SDK rejected streaming pipe: %v", err)
+	}
+	if received == 0 {
+		t.Fatal("test S3 endpoint received an empty request")
+	}
+}
+
+func TestS3StageResolvesAmbiguousSuccessfulUpload(t *testing.T) {
+	client := &observingS3{memoryS3: newMemoryS3()}
+	store := &S3Store{client: client, bucket: "bucket", prefix: "walgit", timeout: time.Second}
+	if err := store.Initialize("repo", "refs/heads/main", "sha1"); err != nil {
+		t.Fatal(err)
+	}
+	client.failTransactionAfterStore = true
+	objects := t.TempDir()
+	updates := []RefUpdate{{Old: strings.Repeat("0", 40), New: strings.Repeat("a", 40), Ref: "refs/heads/main"}}
+	if err := store.Stage("repo", objects, updates); err != nil {
+		t.Fatalf("ambiguous completed upload was not resolved: %v", err)
+	}
+	entry, _, err := store.Commit("repo", updates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.SHA256 == "" || entry.Bytes == 0 {
+		t.Fatalf("resolved object metadata is incomplete: %#v", entry)
+	}
+}
+
+func TestS3ColdCommitRecoversDigestForStreamedObject(t *testing.T) {
+	client := newMemoryS3()
+	store := &S3Store{client: client, bucket: "bucket", prefix: "walgit", timeout: time.Second}
+	if err := store.Initialize("repo", "refs/heads/main", "sha1"); err != nil {
+		t.Fatal(err)
+	}
+	objects := t.TempDir()
+	updates := []RefUpdate{{Old: strings.Repeat("0", 40), New: strings.Repeat("a", 40), Ref: "refs/heads/main"}}
+	if err := store.Stage("repo", objects, updates); err != nil {
+		t.Fatal(err)
+	}
+
+	// A restarted coordinator has no in-memory digest. It must derive and
+	// verify the immutable transaction before publishing it in the manifest.
+	restarted := &S3Store{client: client, bucket: "bucket", prefix: "walgit", timeout: time.Second}
+	entry, _, err := restarted.Commit("repo", updates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.SHA256 == "" || entry.Bytes == 0 {
+		t.Fatalf("cold commit recovered incomplete metadata: %#v", entry)
+	}
+}
+
+func TestS3ColdCommitRejectsCorruptedStreamedObject(t *testing.T) {
+	client := newMemoryS3()
+	store := &S3Store{client: client, bucket: "bucket", prefix: "walgit", timeout: time.Second}
+	if err := store.Initialize("repo", "refs/heads/main", "sha1"); err != nil {
+		t.Fatal(err)
+	}
+	updates := []RefUpdate{{Old: strings.Repeat("0", 40), New: strings.Repeat("a", 40), Ref: "refs/heads/main"}}
+	if err := store.Stage("repo", t.TempDir(), updates); err != nil {
+		t.Fatal(err)
+	}
+	txID, err := transactionID(updates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := store.key("repo", "transactions/"+txID+".wal")
+	client.mu.Lock()
+	object := client.objects[key]
+	object.data[0] ^= 0xff
+	client.objects[key] = object
+	client.mu.Unlock()
+
+	restarted := &S3Store{client: client, bucket: "bucket", prefix: "walgit", timeout: time.Second}
+	if _, _, err := restarted.Commit("repo", updates); err == nil {
+		t.Fatal("cold commit published a corrupted streamed object")
+	}
+}
+
+func TestS3StageRejectsProviderChecksumMismatch(t *testing.T) {
+	client := &observingS3{memoryS3: newMemoryS3(), corruptTransactionChecksum: true}
+	store := &S3Store{client: client, bucket: "bucket", prefix: "walgit", timeout: time.Second}
+	if err := store.Initialize("repo", "refs/heads/main", "sha1"); err != nil {
+		t.Fatal(err)
+	}
+	updates := []RefUpdate{{Old: strings.Repeat("0", 40), New: strings.Repeat("a", 40), Ref: "refs/heads/main"}}
+	if err := store.Stage("repo", t.TempDir(), updates); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("expected provider checksum mismatch, got %v", err)
+	}
+}
+
+type observingS3 struct {
+	*memoryS3
+	transactionBodyWasFile      bool
+	transactionContentLengthSet bool
+	transactionChecksum         types.ChecksumAlgorithm
+	failTransactionAfterStore   bool
+	corruptTransactionChecksum  bool
+}
+
+func (s *observingS3) PutObject(ctx context.Context, input *s3.PutObjectInput, options ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	transaction := strings.Contains(aws.ToString(input.Key), "/transactions/")
+	if transaction {
+		_, s.transactionBodyWasFile = input.Body.(*os.File)
+		s.transactionContentLengthSet = input.ContentLength != nil
+		s.transactionChecksum = input.ChecksumAlgorithm
+	}
+	out, err := s.memoryS3.PutObject(ctx, input, options...)
+	if err != nil || !transaction {
+		return out, err
+	}
+	if s.failTransactionAfterStore {
+		s.failTransactionAfterStore = false
+		return nil, errors.New("injected connection loss after durable store")
+	}
+	if s.corruptTransactionChecksum {
+		out.ChecksumSHA256 = aws.String("not-the-uploaded-checksum")
+	}
+	return out, nil
 }
 
 type memoryS3 struct {

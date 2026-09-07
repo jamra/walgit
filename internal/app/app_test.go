@@ -43,6 +43,25 @@ func TestReadReferenceUpdatesIgnoresSymbolicHEADNotification(t *testing.T) {
 	}
 }
 
+func TestInitConfiguresDurableGitCacheWrites(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo.git")
+	if err := Init(repo, filepath.Join(root, "store"), "repo"); err != nil {
+		t.Fatal(err)
+	}
+	fsync, err := commandOutput("", "git", "-C", repo, "config", "--get", "core.fsync")
+	if err != nil {
+		t.Fatal(err)
+	}
+	method, err := commandOutput("", "git", "-C", repo, "config", "--get", "core.fsyncMethod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fsync != "committed" || method != "fsync" {
+		t.Fatalf("unexpected durability configuration: core.fsync=%q core.fsyncMethod=%q", fsync, method)
+	}
+}
+
 func TestPersistentWriterGroupsConcurrentCommits(t *testing.T) {
 	root := t.TempDir()
 	storePath := filepath.Join(root, "store")

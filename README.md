@@ -7,6 +7,10 @@ the authoritative repository state.
 
 Licensed under the [MIT License](LICENSE).
 
+The enforced crash-safety guarantees, failure behavior, and stronger
+dual-authority deployment needed for provider-loss durability are described in
+[the reliability model](docs/reliability.md).
+
 The filesystem backend provides a local correctness and performance baseline.
 The S3-compatible backend stores immutable transactions and checkpoints as
 objects. Stores that support conditional `PutObject` requests linearize
@@ -113,6 +117,34 @@ The bucket identity needs `GetObject`, `PutObject`, `HeadObject`,
 `ListBucket`, and `DeleteObject` for the configured prefix. S3 conditional
 writes must be supported; a losing manifest writer receives a precondition
 failure, reloads the winner, and retries against the new ETag.
+
+WAL transactions and checkpoints are generated directly into a bounded
+stream while their SHA-256 digest is calculated from the same bytes. The
+normal S3 path therefore has no local temporary archive, no local `fsync`, and
+no complete-file reread. Uploads request S3's SHA-256 integrity check and
+compare a returned checksum when the provider supplies one. If an upload
+times out after the provider may have accepted it, walgit resolves the
+ambiguous result by reading and hashing the immutable object; it never
+blindly overwrites it. A restarted writer performs the same recovery when its
+in-memory staged-object metadata is absent.
+
+The included `BenchmarkS3StageFourMiB` isolates archive construction and
+upload-body delivery with a 4 MiB pack and an in-memory S3 sink. Five runs on
+an Apple M1 Max measured the following; this intentionally excludes network
+latency and provider processing:
+
+| S3 stage implementation | Mean time | Throughput | Allocated bytes | Allocations |
+| --- | ---: | ---: | ---: | ---: |
+| Temporary file + sync + two rereads | 13.80 ms | 304 MB/s | 74.5 KiB | 88 |
+| One-pass bounded stream | **2.66 ms** | **1,578 MB/s** | **43.5 KiB** | **80** |
+
+That is a 5.2x improvement in the client-side stage path and 42% fewer
+allocated bytes. Run it on the target host with:
+
+```sh
+go test ./internal/wal -run '^$' \
+  -bench BenchmarkS3StageFourMiB -benchmem -count 5
+```
 
 The [DigitalOcean Spaces API reference](https://docs.digitalocean.com/reference/api/spaces/)
 does not expose destination `If-Match` as a supported `PutObject` header, so
@@ -329,7 +361,13 @@ reconstructs refs and objects from the latest checkpoint plus WAL tail.
 - Reconciliation is idempotent across crashes between object extraction, ref
   updates, and generation-marker writes.
 - Replayed loose objects and pack components are fsynced to temporary files and
-  atomically renamed, so a crash cannot make a partial object look complete.
+  atomically renamed. Every affected object directory is then fsynced before
+  the generation marker advances, so neither a partial object nor a lost
+  rename can masquerade as a current cache.
+- Serving repositories use `core.fsync=committed` with
+  `core.fsyncMethod=fsync`; objects and references represented by a durable
+  local generation marker therefore use real cache-flush semantics, including
+  on macOS.
 - Git's unsynchronized automatic GC and maintenance are disabled on serving
   caches. Scheduled compaction performs a controlled cache repack while holding
   that repository's exclusive serving lock.
@@ -337,6 +375,18 @@ reconstructs refs and objects from the latest checkpoint plus WAL tail.
   into WAL entries or checkpoints.
 - WAL and checkpoint contents are protected by SHA-256 checksums.
 - Filesystem manifest publication uses an advisory lock plus atomic rename.
+  File contents are synced before rename and the containing directory is
+  synced afterward. A checkpoint directory is synced before a manifest may
+  durably reference the new checkpoint.
+- Any filesystem WAL write, close, file-sync, directory-sync, or
+  persistence-class rename error poisons the entire store. The current process refuses all later operations,
+  even if a subsequent `fsync` would appear to succeed, and writes a
+  best-effort `.walgit-poisoned` sentinel so independent hook processes also
+  fail closed. Do not simply delete this marker: repair or replace the storage,
+  reconstruct and verify the store from an independent authority, then remove
+  it as an explicit operator recovery action. This fail-stop rule follows the
+  recovery model documented after PostgreSQL's
+  [fsyncgate investigation](https://wiki.postgresql.org/wiki/Fsync_Errors).
 - S3 manifest publication normally uses `If-Match` ETag CAS; immutable object
   creation uses `If-None-Match: *`. The explicit compatibility mode replaces
   the manifest unconditionally and therefore requires the repository-scoped
@@ -360,6 +410,13 @@ DigitalOcean Spaces uses the included per-repository writer coordinator because
 its object API cannot perform the required manifest CAS. The coordinator does
 not yet have distributed leases or automatic primary failover, so operators
 must ensure that only one instance is active for a Spaces-backed repository.
+One S3 bucket is still one administrative failure domain. For a strict
+"no acknowledged data loss after losing a provider/account/region" policy,
+the deployment must acknowledge only after independently writing the same
+immutable transaction to two separately administered durable stores. That
+dual-authority commit protocol and its repair worker are not yet built into
+this prototype; ordinary provider replication, versioning, or RAID alone must
+not be described as satisfying that policy.
 There is no built-in service discovery, rendezvous-hash router, gossip, or
 cache warming. The system also has no LFS integration, admission-control
 quotas, or TLS termination. Scheduled maintenance is intentionally serialized

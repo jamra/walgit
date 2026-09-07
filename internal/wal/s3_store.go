@@ -2,7 +2,9 @@ package wal
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,6 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	awshttp "github.com/aws/smithy-go/transport/http"
 )
@@ -46,6 +49,122 @@ type S3Store struct {
 type stagedS3Transaction struct {
 	digest string
 	bytes  int64
+}
+
+type streamedArchiveResult struct {
+	object stagedS3Transaction
+	rawSum []byte
+	err    error
+}
+
+type countingWriter struct {
+	writer io.Writer
+	bytes  int64
+}
+
+func (w *countingWriter) Write(data []byte) (int, error) {
+	n, err := w.writer.Write(data)
+	w.bytes += int64(n)
+	return n, err
+}
+
+// putStreamedObject generates an archive exactly once while the S3 client is
+// uploading it. io.Pipe provides bounded backpressure; the SHA-256 is updated
+// from the same byte slices sent to the client, so the normal path has no
+// durable local spool and no complete-file reread.
+func (s *S3Store) putStreamedObject(repoID, relative string, produce func(io.Writer) error, validate func(io.Reader) error) (stagedS3Transaction, error) {
+	reader, writer := io.Pipe()
+	completed := make(chan streamedArchiveResult, 1)
+	go func() {
+		hash := sha256.New()
+		counted := &countingWriter{writer: io.MultiWriter(writer, hash)}
+		err := produce(counted)
+		if err != nil {
+			_ = writer.CloseWithError(err)
+		} else {
+			err = writer.Close()
+		}
+		sum := hash.Sum(nil)
+		completed <- streamedArchiveResult{
+			object: stagedS3Transaction{digest: hex.EncodeToString(sum), bytes: counted.bytes},
+			rawSum: sum,
+			err:    err,
+		}
+	}()
+
+	ctx, cancel := s.context()
+	out, putErr := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(s.key(repoID, relative)),
+		Body: reader, IfNoneMatch: aws.String("*"), ContentType: aws.String("application/octet-stream"),
+		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
+	})
+	cancel()
+	if putErr != nil {
+		_ = reader.CloseWithError(putErr)
+	} else {
+		_ = reader.Close()
+	}
+	result := <-completed
+
+	if putErr != nil {
+		// A timeout can happen after the provider durably accepted the object.
+		// The immutable key makes an existence+checksum read a safe resolution
+		// for both ambiguous failures and ordinary idempotent retries.
+		existing, inspectErr := s.inspectStreamedObject(repoID, relative, validate)
+		if inspectErr == nil {
+			return existing, nil
+		}
+		if isPrecondition(putErr) {
+			return stagedS3Transaction{}, fmt.Errorf("inspect existing immutable object after precondition failure: %w", inspectErr)
+		}
+		return stagedS3Transaction{}, putErr
+	}
+	if result.err != nil {
+		return stagedS3Transaction{}, fmt.Errorf("stream archive: %w", result.err)
+	}
+	if out != nil && out.ChecksumSHA256 != nil {
+		expected := base64.StdEncoding.EncodeToString(result.rawSum)
+		if actual := aws.ToString(out.ChecksumSHA256); actual != expected {
+			return stagedS3Transaction{}, fmt.Errorf("S3 checksum mismatch for %s: got %s, want %s", relative, actual, expected)
+		}
+	}
+	return result.object, nil
+}
+
+func (s *S3Store) inspectStreamedObject(repoID, relative string, validate func(io.Reader) error) (stagedS3Transaction, error) {
+	head, err := s.head(repoID, relative)
+	if err != nil {
+		return stagedS3Transaction{}, err
+	}
+	if digest := head.Metadata["walgit-sha256"]; digest != "" && validate == nil {
+		return stagedS3Transaction{digest: digest, bytes: aws.ToInt64(head.ContentLength)}, nil
+	}
+	body, err := s.get(repoID, relative)
+	if err != nil {
+		return stagedS3Transaction{}, err
+	}
+	hash := sha256.New()
+	hashed := &countingWriter{writer: hash}
+	var readErr error
+	if validate == nil {
+		_, readErr = io.Copy(hashed, body)
+	} else {
+		readErr = validate(io.TeeReader(body, hashed))
+		if readErr == nil {
+			_, readErr = io.Copy(hashed, body)
+		}
+	}
+	closeErr := body.Close()
+	if readErr != nil {
+		return stagedS3Transaction{}, readErr
+	}
+	if closeErr != nil {
+		return stagedS3Transaction{}, closeErr
+	}
+	if expected := aws.ToInt64(head.ContentLength); expected != 0 && hashed.bytes != expected {
+		return stagedS3Transaction{}, fmt.Errorf("S3 object length mismatch for %s: got %d, want %d", relative, hashed.bytes, expected)
+	}
+	return stagedS3Transaction{digest: hex.EncodeToString(hash.Sum(nil)), bytes: hashed.bytes}, nil
 }
 
 func OpenS3(location string) (Backend, error) {
@@ -144,50 +263,22 @@ func (s *S3Store) Stage(repoID, objectDir string, updates []RefUpdate) error {
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp("", "walgit-s3-stage-*.wal")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	defer os.Remove(name)
 	meta := EntryMeta{TransactionID: txID, CreatedAt: time.Now().UTC(), Updates: updates}
-	if err := writeArchive(tmp, meta, objectDir); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	digest, size, err := fileDigest(name)
-	if err != nil {
-		return err
-	}
-	f, err := os.Open(name)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	ctx, cancel := s.context()
-	defer cancel()
-	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(s.bucket), Key: aws.String(s.key(repoID, "transactions/"+txID+".wal")),
-		Body: f, ContentLength: aws.Int64(size), IfNoneMatch: aws.String("*"),
-		Metadata: map[string]string{"walgit-sha256": digest}, ContentType: aws.String("application/octet-stream"),
+	object, err := s.putStreamedObject(repoID, "transactions/"+txID+".wal", func(w io.Writer) error {
+		return writeArchive(w, meta, objectDir)
+	}, func(r io.Reader) error {
+		return validateEntryArchive(r, txID)
 	})
-	if err == nil || isPrecondition(err) {
-		s.stateMu.Lock()
-		if s.staged == nil {
-			s.staged = make(map[string]stagedS3Transaction)
-		}
-		s.staged[repoID+"/"+txID] = stagedS3Transaction{digest: digest, bytes: size}
-		s.stateMu.Unlock()
-		return nil // An immutable retry is the same staged transaction.
+	if err != nil {
+		return err
 	}
-	return err
+	s.stateMu.Lock()
+	if s.staged == nil {
+		s.staged = make(map[string]stagedS3Transaction)
+	}
+	s.staged[repoID+"/"+txID] = object
+	s.stateMu.Unlock()
+	return nil
 }
 
 func (s *S3Store) Commit(repoID string, updates []RefUpdate) (ManifestEntry, Manifest, error) {
@@ -224,13 +315,13 @@ func (s *S3Store) CommitBatch(repoID string, batches [][]RefUpdate) ([]ManifestE
 			staged[i].object = object
 			continue
 		}
-		head, err := s.head(repoID, staged[i].file)
+		object, err := s.inspectStreamedObject(repoID, staged[i].file, func(r io.Reader) error {
+			return validateEntryArchive(r, staged[i].txID)
+		})
 		if err != nil {
 			return nil, Manifest{}, fmt.Errorf("read staged transaction: %w", err)
 		}
-		staged[i].object = stagedS3Transaction{
-			digest: head.Metadata["walgit-sha256"], bytes: aws.ToInt64(head.ContentLength),
-		}
+		staged[i].object = object
 		if staged[i].object.digest == "" {
 			return nil, Manifest{}, errors.New("staged transaction is missing its SHA-256 metadata")
 		}
@@ -486,46 +577,18 @@ func (s *S3Store) abortCoordinated(repoID string, updates []RefUpdate) error {
 }
 
 func (s *S3Store) putMetadataTransaction(repoID, transactionFile string, meta EntryMeta) (*s3.HeadObjectOutput, error) {
-	tmp, err := os.CreateTemp("", "walgit-s3-metadata-*.wal")
-	if err != nil {
-		return nil, err
-	}
-	name := tmp.Name()
-	defer os.Remove(name)
-	if err := writeMetadataArchive(tmp, meta); err != nil {
-		tmp.Close()
-		return nil, err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return nil, err
-	}
-	if err := tmp.Close(); err != nil {
-		return nil, err
-	}
-	digest, size, err := fileDigest(name)
-	if err != nil {
-		return nil, err
-	}
-	f, err := os.Open(name)
-	if err != nil {
-		return nil, err
-	}
-	ctx, cancel := s.context()
-	_, putErr := s.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(s.bucket), Key: aws.String(s.key(repoID, transactionFile)), Body: f,
-		ContentLength: aws.Int64(size), IfNoneMatch: aws.String("*"),
-		Metadata: map[string]string{"walgit-sha256": digest}, ContentType: aws.String("application/octet-stream"),
+	object, err := s.putStreamedObject(repoID, transactionFile, func(w io.Writer) error {
+		return writeMetadataArchive(w, meta)
+	}, func(r io.Reader) error {
+		return validateEntryArchive(r, meta.TransactionID)
 	})
-	cancel()
-	closeErr := f.Close()
-	if putErr != nil && !isPrecondition(putErr) {
-		return nil, putErr
+	if err != nil {
+		return nil, err
 	}
-	if closeErr != nil {
-		return nil, closeErr
-	}
-	return s.head(repoID, transactionFile)
+	return &s3.HeadObjectOutput{
+		ContentLength: aws.Int64(object.bytes),
+		Metadata:      map[string]string{"walgit-sha256": object.digest},
+	}, nil
 }
 
 func (s *S3Store) Load(repoID string) (Manifest, error) {
@@ -601,53 +664,26 @@ func (s *S3Store) CreateCheckpoint(repoID, gitObjects string, expectedGeneration
 	if len(m.Prepared) > 0 {
 		return Checkpoint{}, errors.New("cannot checkpoint while reference transactions are prepared")
 	}
-	tmp, err := os.CreateTemp("", "walgit-s3-checkpoint-*.wal")
-	if err != nil {
-		return Checkpoint{}, err
-	}
-	name := tmp.Name()
-	defer os.Remove(name)
 	meta := CheckpointMeta{
 		Generation: m.Generation, CreatedAt: time.Now().UTC(), Head: m.Head,
 		ObjectFormat: m.ObjectFormat, Refs: cloneRefs(m.Refs),
 	}
-	if err := writeCheckpointArchive(tmp, meta, gitObjects); err != nil {
-		tmp.Close()
-		return Checkpoint{}, err
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return Checkpoint{}, fmt.Errorf("generate checkpoint object name: %w", err)
 	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return Checkpoint{}, err
-	}
-	if err := tmp.Close(); err != nil {
-		return Checkpoint{}, err
-	}
-	digest, size, err := fileDigest(name)
+	checkpointFile := fmt.Sprintf("checkpoints/%020d-%s.checkpoint", m.Generation, hex.EncodeToString(nonce[:]))
+	object, err := s.putStreamedObject(repoID, checkpointFile, func(w io.Writer) error {
+		return writeCheckpointArchive(w, meta, gitObjects)
+	}, func(r io.Reader) error {
+		return validateCheckpointArchive(r, meta.Generation)
+	})
 	if err != nil {
 		return Checkpoint{}, err
 	}
 	checkpoint := Checkpoint{
-		Generation: m.Generation,
-		File:       fmt.Sprintf("checkpoints/%020d-%s.checkpoint", m.Generation, digest[:16]),
-		SHA256:     digest, Bytes: size,
-	}
-	f, err := os.Open(name)
-	if err != nil {
-		return Checkpoint{}, err
-	}
-	ctx, cancel := s.context()
-	_, putErr := s.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(s.bucket), Key: aws.String(s.key(repoID, checkpoint.File)), Body: f,
-		ContentLength: aws.Int64(size), IfNoneMatch: aws.String("*"),
-		Metadata: map[string]string{"walgit-sha256": digest}, ContentType: aws.String("application/octet-stream"),
-	})
-	cancel()
-	closeErr := f.Close()
-	if putErr != nil && !isPrecondition(putErr) {
-		return Checkpoint{}, putErr
-	}
-	if closeErr != nil {
-		return Checkpoint{}, closeErr
+		Generation: m.Generation, File: checkpointFile,
+		SHA256: object.digest, Bytes: object.bytes,
 	}
 	for attempt := 0; attempt < 32; attempt++ {
 		latest, etag, err := s.loadWithETag(repoID)
