@@ -66,6 +66,49 @@ and verifies the final manifest generation and ref set. Its report separates
 push latency, cross-node read-after-write latency, concurrent latency, and
 writer batch effectiveness.
 
+## Benchmark results
+
+These are development measurements, not service-level guarantees. Raw Git is
+included as a latency floor; its default local configuration does **not** offer
+the same acknowledged-commit durability as walgit's fsynced WAL path.
+
+### Raw Git versus walgit
+
+One run on 2026-09-07 on Apple Silicon (`arm64`, macOS 26.2) at commit
+`2bed065` used 100 sequential pushes with 64 KiB changed per push. Both
+destinations were local; the walgit destination used the filesystem WAL
+backend.
+
+| Local push target | Mean | p50 | p90 | p99 | Worst | Pushes/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Raw bare Git, default configuration | **50.78 ms** | **50.29 ms** | **52.17 ms** | **58.40 ms** | **60.47 ms** | **19.69** |
+| walgit, fsynced filesystem WAL | 166.96 ms | 157.16 ms | 168.09 ms | 276.47 ms | 739.66 ms | 5.99 |
+
+The current durability path was 3.29x the raw-Git mean latency, or 228.8%
+overhead. Reconstructing and strictly verifying the 100-push repository took
+3.96 s; checkpoint creation took 5.09 s and restoration from that checkpoint
+took 2.41 s. The restored and serving heads matched.
+
+Reproduce this comparison with:
+
+```sh
+go build -o ./bin/walgit ./cmd/walgit
+./bin/walgit bench -pushes 100 -blob-bytes 65536
+```
+
+Additional measured results appear below:
+
+- [4 MiB in-memory S3 stage benchmark](#4-mib-in-memory-s3-stage-benchmark),
+  isolating streaming, hashing, chunking, and fanout costs.
+- [DigitalOcean Spaces end-to-end benchmark](#digitalocean-spaces-end-to-end-benchmark),
+  including same-region push and cross-node latency.
+
+The new [dual-authority benchmark](docs/disaster-drills.md#dual-authority-latency-benchmark)
+reports raw Git, one S3 authority, replicated blobs, and full certificate
+commits in one run. A dual-provider result is not published yet because two
+independently configured providers have not been measured; the older
+DigitalOcean run must not be presented as equivalent to that test.
+
 ## Repository lifecycle
 
 Create a repository and durable store:
@@ -266,6 +309,8 @@ certificate garbage collection remain disabled. Use a separate store prefix per
 tenant or security domain; cross-tenant deduplication can leak whether content
 already exists.
 
+### 4 MiB in-memory S3 stage benchmark
+
 The included benchmarks isolate archive/blob construction and upload-body
 delivery with a 4 MiB pack and in-memory S3 sinks. Five runs on an Apple M1 Max
 measured the following; this intentionally excludes network latency, TLS, and
@@ -340,6 +385,8 @@ The `gateway` or `serve` process and its Git hooks must inherit the same
 `WALGIT_WRITER_SOCKET` value. Protect the socket as owner-only and supervise the
 writer as a required dependency: if it is configured but unavailable, Git
 requests fail closed instead of bypassing serialization.
+
+### DigitalOcean Spaces end-to-end benchmark
 
 The following two-node runs used 100 pushes with 64 KiB changed per push. The
 same-region runs executed on a temporary 2-vCPU machine in `nyc3` beside the
