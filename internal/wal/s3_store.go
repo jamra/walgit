@@ -81,10 +81,14 @@ func (w *countingWriter) Write(data []byte) (int, error) {
 }
 
 // putStreamedObject generates an archive exactly once while the S3 client is
-// uploading it. io.Pipe provides bounded backpressure; the SHA-256 is updated
-// from the same byte slices sent to the client, so the normal path has no
+// uploading it. Its caller computes the exact tar length from metadata before
+// production; io.Pipe then provides bounded backpressure and the SHA-256 is
+// updated from the same byte slices sent to the client. The normal path has no
 // durable local spool and no complete-file reread.
-func (s *S3Store) putStreamedObject(repoID, relative string, produce func(io.Writer) error, validate func(io.Reader) error) (stagedS3Transaction, error) {
+func (s *S3Store) putStreamedObject(repoID, relative string, contentLength int64, produce func(io.Writer) error, validate func(io.Reader) error) (stagedS3Transaction, error) {
+	if contentLength <= 0 {
+		return stagedS3Transaction{}, errors.New("streamed S3 object requires a positive content length")
+	}
 	reader, writer := io.Pipe()
 	completed := make(chan streamedArchiveResult, 1)
 	go func() {
@@ -107,7 +111,7 @@ func (s *S3Store) putStreamedObject(repoID, relative string, produce func(io.Wri
 	ctx, cancel := s.context()
 	out, putErr := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(s.key(repoID, relative)),
-		Body: reader, IfNoneMatch: aws.String("*"), ContentType: aws.String("application/octet-stream"),
+		Body: reader, IfNoneMatch: aws.String("*"), ContentLength: aws.Int64(contentLength), ContentType: aws.String("application/octet-stream"),
 		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
 	})
 	cancel()
@@ -133,6 +137,9 @@ func (s *S3Store) putStreamedObject(repoID, relative string, produce func(io.Wri
 	}
 	if result.err != nil {
 		return stagedS3Transaction{}, fmt.Errorf("stream archive: %w", result.err)
+	}
+	if result.object.bytes != contentLength {
+		return stagedS3Transaction{}, fmt.Errorf("stream archive length mismatch: wrote %d bytes, planned %d", result.object.bytes, contentLength)
 	}
 	if out != nil && out.ChecksumSHA256 != nil {
 		expected := base64.StdEncoding.EncodeToString(result.rawSum)
@@ -386,7 +393,11 @@ func (s *S3Store) Stage(repoID, objectDir string, updates []RefUpdate) error {
 	if err := failpoint("s3.stage.before_wal_upload"); err != nil {
 		return err
 	}
-	object, err := s.putStreamedObject(repoID, "transactions/"+txID+".wal", func(w io.Writer) error {
+	contentLength, err := entryArchiveSize(meta, objectDir)
+	if err != nil {
+		return err
+	}
+	object, err := s.putStreamedObject(repoID, "transactions/"+txID+".wal", contentLength, func(w io.Writer) error {
 		return writeArchive(w, meta, objectDir)
 	}, func(r io.Reader) error {
 		recovered, validateErr := readEntryArchiveMeta(r)
@@ -776,7 +787,11 @@ func (s *S3Store) putMetadataTransaction(repoID, transactionFile string, meta En
 		}
 	}
 	usedDescriptor := meta.Descriptor
-	object, err := s.putStreamedObject(repoID, transactionFile, func(w io.Writer) error {
+	contentLength, err := metadataArchiveSize(meta)
+	if err != nil {
+		return stagedS3Transaction{}, err
+	}
+	object, err := s.putStreamedObject(repoID, transactionFile, contentLength, func(w io.Writer) error {
 		return writeMetadataArchive(w, meta)
 	}, func(r io.Reader) error {
 		recovered, validateErr := readEntryArchiveMeta(r)
@@ -922,7 +937,11 @@ func (s *S3Store) CreateCheckpoint(repoID, gitObjects string, expectedGeneration
 		return Checkpoint{}, fmt.Errorf("generate checkpoint object name: %w", err)
 	}
 	checkpointFile := fmt.Sprintf("checkpoints/%020d-%s.checkpoint", m.Generation, hex.EncodeToString(nonce[:]))
-	object, err := s.putStreamedObject(repoID, checkpointFile, func(w io.Writer) error {
+	contentLength, err := checkpointArchiveSize(meta, gitObjects)
+	if err != nil {
+		return Checkpoint{}, err
+	}
+	object, err := s.putStreamedObject(repoID, checkpointFile, contentLength, func(w io.Writer) error {
 		return writeCheckpointArchive(w, meta, gitObjects)
 	}, func(r io.Reader) error {
 		return validateCheckpointArchive(r, meta.Generation)

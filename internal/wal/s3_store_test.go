@@ -465,11 +465,70 @@ func TestS3StageStreamsWithoutLocalFileAndRequestsSHA256(t *testing.T) {
 	if client.transactionBodyWasFile {
 		t.Fatal("transaction upload used an os.File instead of the streaming pipe")
 	}
-	if client.transactionContentLengthSet {
-		t.Fatal("transaction upload unexpectedly required a precomputed content length")
+	if !client.transactionContentLengthSet {
+		t.Fatal("transaction upload omitted the content length required by AWS S3")
+	}
+	if client.transactionContentLength <= 1<<20 {
+		t.Fatalf("transaction content length = %d, want tar overhead plus payload", client.transactionContentLength)
 	}
 	if client.transactionChecksum != types.ChecksumAlgorithmSha256 {
 		t.Fatalf("checksum algorithm = %q, want SHA256", client.transactionChecksum)
+	}
+}
+
+func TestPlannedArchiveLengthsMatchEncodedBytes(t *testing.T) {
+	objects := filepath.Join(t.TempDir(), "objects")
+	longDirectory := strings.Repeat("nested-", 16)
+	objectPath := filepath.Join(objects, longDirectory, "object.pack")
+	if err := os.MkdirAll(filepath.Dir(objectPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(objectPath, bytes.Repeat([]byte("payload"), 1000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entry := EntryMeta{
+		TransactionID: strings.Repeat("a", 64), CreatedAt: time.Unix(1, 0).UTC(),
+		Updates: []RefUpdate{{Old: strings.Repeat("0", 40), New: strings.Repeat("b", 40), Ref: "refs/heads/main"}},
+	}
+	checkpoint := CheckpointMeta{
+		Generation: 1, CreatedAt: time.Unix(1, 0).UTC(), Head: "refs/heads/main",
+		ObjectFormat: "sha1", Refs: map[string]string{"refs/heads/main": strings.Repeat("b", 40)},
+	}
+
+	var entryArchive bytes.Buffer
+	if err := writeArchive(&entryArchive, entry, objects); err != nil {
+		t.Fatal(err)
+	}
+	entryLength, err := entryArchiveSize(entry, objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entryLength != int64(entryArchive.Len()) {
+		t.Fatalf("entry archive length = %d, encoded = %d", entryLength, entryArchive.Len())
+	}
+
+	var checkpointArchive bytes.Buffer
+	if err := writeCheckpointArchive(&checkpointArchive, checkpoint, objects); err != nil {
+		t.Fatal(err)
+	}
+	checkpointLength, err := checkpointArchiveSize(checkpoint, objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkpointLength != int64(checkpointArchive.Len()) {
+		t.Fatalf("checkpoint archive length = %d, encoded = %d", checkpointLength, checkpointArchive.Len())
+	}
+
+	var metadataArchive bytes.Buffer
+	if err := writeMetadataArchive(&metadataArchive, entry); err != nil {
+		t.Fatal(err)
+	}
+	metadataLength, err := metadataArchiveSize(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadataLength != int64(metadataArchive.Len()) {
+		t.Fatalf("metadata archive length = %d, encoded = %d", metadataLength, metadataArchive.Len())
 	}
 }
 
@@ -577,6 +636,10 @@ func TestAWSSDKAcceptsUnseekableStreamingArchive(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPut {
 			http.Error(response, "unexpected method", http.StatusMethodNotAllowed)
+			return
+		}
+		if request.ContentLength <= 0 {
+			http.Error(response, "missing content length", http.StatusLengthRequired)
 			return
 		}
 		var err error
@@ -694,6 +757,7 @@ type observingS3 struct {
 	*memoryS3
 	transactionBodyWasFile      bool
 	transactionContentLengthSet bool
+	transactionContentLength    int64
 	transactionChecksum         types.ChecksumAlgorithm
 	failTransactionAfterStore   bool
 	corruptTransactionChecksum  bool
@@ -704,6 +768,7 @@ func (s *observingS3) PutObject(ctx context.Context, input *s3.PutObjectInput, o
 	if transaction {
 		_, s.transactionBodyWasFile = input.Body.(*os.File)
 		s.transactionContentLengthSet = input.ContentLength != nil
+		s.transactionContentLength = aws.ToInt64(input.ContentLength)
 		s.transactionChecksum = input.ChecksumAlgorithm
 	}
 	out, err := s.memoryS3.PutObject(ctx, input, options...)

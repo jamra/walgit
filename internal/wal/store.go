@@ -1084,7 +1084,78 @@ func writeMetadataArchive(w io.Writer, meta EntryMeta) error {
 	return tw.Close()
 }
 
-func writeObjectFiles(tw *tar.Writer, objectDir string) error {
+func entryArchiveSize(meta EntryMeta, objectDir string) (int64, error) {
+	metaJSON, err := json.Marshal(meta)
+	if err != nil {
+		return 0, err
+	}
+	return measureArchive("meta.json", metaJSON, objectDir, len(meta.Objects) == 0 && meta.Descriptor == nil)
+}
+
+func checkpointArchiveSize(meta CheckpointMeta, objectDir string) (int64, error) {
+	metaJSON, err := json.Marshal(meta)
+	if err != nil {
+		return 0, err
+	}
+	return measureArchive("checkpoint.json", metaJSON, objectDir, len(meta.Objects) == 0 && meta.Descriptor == nil)
+}
+
+func metadataArchiveSize(meta EntryMeta) (int64, error) {
+	metaJSON, err := json.Marshal(meta)
+	if err != nil {
+		return 0, err
+	}
+	return measureArchive("meta.json", metaJSON, "", false)
+}
+
+type archiveSizingReader struct{}
+
+func (archiveSizingReader) Read(data []byte) (int, error) {
+	return len(data), nil
+}
+
+// measureArchive asks archive/tar to encode the real headers while replacing
+// file payload reads with a synthetic reader. This accounts for padding and
+// any extended headers without rereading object contents or retaining them in
+// memory.
+func measureArchive(metaName string, metaJSON []byte, objectDir string, includeObjects bool) (int64, error) {
+	counted := &countingWriter{writer: io.Discard}
+	tw := tar.NewWriter(counted)
+	if err := tw.WriteHeader(&tar.Header{Name: metaName, Mode: 0o644, Size: int64(len(metaJSON))}); err != nil {
+		return 0, err
+	}
+	if _, err := tw.Write(metaJSON); err != nil {
+		return 0, err
+	}
+	if includeObjects {
+		paths, err := archiveObjectPaths(objectDir)
+		if err != nil {
+			return 0, err
+		}
+		for _, objectPath := range paths {
+			rel, err := filepath.Rel(objectDir, objectPath)
+			if err != nil {
+				return 0, err
+			}
+			info, err := os.Stat(objectPath)
+			if err != nil {
+				return 0, err
+			}
+			if err := tw.WriteHeader(&tar.Header{Name: "objects/" + filepath.ToSlash(rel), Mode: 0o444, Size: info.Size()}); err != nil {
+				return 0, err
+			}
+			if _, err := io.CopyN(tw, archiveSizingReader{}, info.Size()); err != nil {
+				return 0, err
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return 0, err
+	}
+	return counted.bytes, nil
+}
+
+func archiveObjectPaths(objectDir string) ([]string, error) {
 	var paths []string
 	if err := filepath.WalkDir(objectDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -1102,9 +1173,17 @@ func writeObjectFiles(tw *tar.Writer, objectDir string) error {
 		}
 		return nil
 	}); err != nil {
-		return err
+		return nil, err
 	}
 	sort.Strings(paths)
+	return paths, nil
+}
+
+func writeObjectFiles(tw *tar.Writer, objectDir string) error {
+	paths, err := archiveObjectPaths(objectDir)
+	if err != nil {
+		return err
+	}
 	for _, path := range paths {
 		rel, err := filepath.Rel(objectDir, path)
 		if err != nil {
