@@ -1,5 +1,9 @@
 # Disaster restore drills
 
+> These commands exercise the historical dual-authority certificate experiment,
+> not the normal single-index CAS architecture. They remain useful research and
+> operational test tools, but their latency is not normal walgit latency.
+
 `walgit drill` proves that one durable authority can reconstruct a repository
 without reading its peer. This is stronger than checking that two manifests or
 object listings match: the command verifies the selected authority's complete

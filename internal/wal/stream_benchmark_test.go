@@ -14,17 +14,25 @@ import (
 )
 
 func BenchmarkS3StageFourMiB(b *testing.B) {
-	benchmarkS3StageFourMiB(b, false)
+	benchmarkS3StageFourMiB(b, 1)
+}
+
+func BenchmarkS3StageFourMiBContentAddressed(b *testing.B) {
+	benchmarkS3StageFourMiB(b, 2)
 }
 
 func BenchmarkS3StageFourMiBDualAuthority(b *testing.B) {
-	benchmarkS3StageFourMiB(b, true)
+	benchmarkS3StageFourMiB(b, 3)
 }
 
-func benchmarkS3StageFourMiB(b *testing.B, dualAuthority bool) {
+func benchmarkS3StageFourMiB(b *testing.B, mode int) {
 	client := &discardPutS3{memoryS3: newMemoryS3()}
 	store := &S3Store{client: client, bucket: "bucket", prefix: "benchmark", timeout: time.Minute}
-	if dualAuthority {
+	if mode >= 2 {
+		store.externalizeTransactions = true
+		store.blobs = s3BlobStore{store: store}
+	}
+	if mode == 3 {
 		secondaryClient := &discardPutS3{memoryS3: newMemoryS3()}
 		secondary := &S3Store{client: secondaryClient, bucket: "secondary", prefix: "benchmark", timeout: time.Minute}
 		store.blobs = replicatedBlobStore{stores: []blobStore{

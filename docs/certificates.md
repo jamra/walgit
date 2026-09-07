@@ -1,8 +1,15 @@
 # Dual-authority commit certificates
 
+> **Historical experiment:** this is not walgit's normal architecture. It is
+> retained so its reliability and latency tradeoffs remain reproducible. The
+> normal path uses one authoritative S3 WAL index with atomic ETag CAS and no
+> certificates, witness, database, or cross-provider coordination. Do not use
+> certificate-mode results as normal walgit benchmark numbers.
+
 Commit certificates make repository ordering reconstructible without the
 primary manifest or primary WAL namespace. The protocol is opt-in because it
-changes the write boundary and requires one serialized writer per repository.
+changes the write boundary, adds both stores to foreground latency, and requires
+one serialized writer per repository.
 
 ## Enabling the protocol
 

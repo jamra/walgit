@@ -1,5 +1,8 @@
 # Scrub and repair
 
+> This runbook covers the historical certificate experiment, not the normal
+> single-authority CAS commit path.
+
 `walgit scrub` proves that both configured durable authorities contain the
 same certificate head and that each authority can independently reconstruct
 every committed payload from that head to its recovery floor. It reads and

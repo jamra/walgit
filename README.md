@@ -2,24 +2,22 @@
 
 `walgit` is a benchmark implementation of a WAL-first Git storage engine,
 inspired by Cursor's Continuity architecture. Normal bare Git repositories are
-disposable serving caches; the versioned manifest and immutable WAL entries are
-the authoritative repository state.
+disposable serving caches; one versioned WAL index and its immutable WAL
+entries are the authoritative repository state.
 
 Licensed under the [MIT License](LICENSE).
 
-The enforced crash-safety guarantees, failure behavior, and stronger
-dual-authority deployment needed for provider-loss durability are described in
-[the reliability model](docs/reliability.md). Continuous integrity verification
-and conservative recovery are covered by the [scrub and repair runbook](docs/scrub-repair.md).
-Independent provider-loss exercises and the layered S3 latency benchmark are
-covered by the [disaster drill guide](docs/disaster-drills.md).
+The enforced crash-safety guarantees and exact failure behavior are described
+in [the reliability model](docs/reliability.md). The protocol intentionally has
+no database, witness, or cross-provider consensus operation in the normal push
+path.
 
 The filesystem backend provides a local correctness and performance baseline.
-The S3-compatible backend stores small transactions inline and splits object
-sets of 1 MiB or more into immutable, content-addressed chunks. Stores that
-support conditional `PutObject` requests linearize manifest updates with ETag
-compare-and-swap; stores without that capability must put a single writer or
-external coordinator in front of each repository.
+The S3-compatible backend streams each push into one immutable WAL object, then
+linearizes the WAL-index update with ETag compare-and-swap. Stores without
+conditional `PutObject` must put one explicitly fenced writer in front of each
+repository. Content-addressed chunk replication remains an opt-in experiment;
+it is no longer imposed on the default push path.
 
 ## Build and benchmark
 
@@ -74,26 +72,34 @@ the same acknowledged-commit durability as walgit's fsynced WAL path.
 
 ### Raw Git versus walgit
 
-One run on 2026-09-07 on Apple Silicon (`arm64`, macOS 26.2) at commit
-`2bed065` used 100 sequential pushes with 64 KiB changed per push. Both
-destinations were local; the walgit destination used the filesystem WAL
-backend.
+One run on 2026-09-07 on Apple Silicon (`arm64`, macOS 26.2) against the
+corrected single-publication build used 100 sequential pushes with 64 KiB
+changed per push. Both destinations were local; walgit used its fsynced
+filesystem WAL backend. The retired result is retained to make the regression
+and correction visible.
 
 | Local push target | Mean | p50 | p90 | p99 | Worst | Pushes/s |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Raw bare Git, default configuration | **50.78 ms** | **50.29 ms** | **52.17 ms** | **58.40 ms** | **60.47 ms** | **19.69** |
-| walgit, fsynced filesystem WAL | 166.96 ms | 157.16 ms | 168.09 ms | 276.47 ms | 739.66 ms | 5.99 |
+| Raw bare Git, default configuration | **50.30 ms** | **50.01 ms** | **51.61 ms** | **55.67 ms** | **56.74 ms** | **19.88** |
+| walgit, corrected one-publication path | 147.18 ms | 142.00 ms | 147.93 ms | 158.53 ms | 603.82 ms | 6.79 |
+| walgit, corrected path + persistent writer | 149.87 ms | 144.24 ms | 151.38 ms | 163.59 ms | 687.36 ms | 6.67 |
+| walgit, retired two-publication path (`2bed065`) | 166.96 ms | 157.16 ms | 168.09 ms | 276.47 ms | 739.66 ms | 5.99 |
 
-The current durability path was 3.29x the raw-Git mean latency, or 228.8%
-overhead. Reconstructing and strictly verifying the 100-push repository took
-3.96 s; checkpoint creation took 5.09 s and restoration from that checkpoint
-took 2.41 s. The restored and serving heads matched.
+The corrected direct path is 2.93x the raw-Git mean, or 192.6% overhead. It is
+11.9% faster by mean and 9.6% faster at p50 than the retired path. A persistent
+writer did not help this sequential local workload; it was 1.8% slower by mean.
+Its purpose is S3 connection/metadata reuse and concurrent group commit, not
+speeding up one-at-a-time filesystem pushes. Reconstructing and strictly
+verifying the corrected 100-push repository took 3.78 s; checkpoint creation
+took 4.46 s and checkpoint restoration took 2.20 s. The restored and serving
+heads matched.
 
 Reproduce this comparison with:
 
 ```sh
 go build -o ./bin/walgit ./cmd/walgit
 ./bin/walgit bench -pushes 100 -blob-bytes 65536
+./bin/walgit bench -pushes 100 -blob-bytes 65536 -persistent-writer
 ```
 
 Additional measured results appear below:
@@ -103,11 +109,10 @@ Additional measured results appear below:
 - [DigitalOcean Spaces end-to-end benchmark](#digitalocean-spaces-end-to-end-benchmark),
   including same-region push and cross-node latency.
 
-The new [dual-authority benchmark](docs/disaster-drills.md#dual-authority-latency-benchmark)
-reports raw Git, one S3 authority, replicated blobs, and full certificate
-commits in one run. A dual-provider result is not published yet because two
-independently configured providers have not been measured; the older
-DigitalOcean run must not be presented as equivalent to that test.
+The historical [dual-authority benchmark](docs/disaster-drills.md#dual-authority-latency-benchmark)
+is retained for experimental comparison. Its certificate protocol is not the
+normal Cursor-style architecture and its results must not be presented as
+normal walgit performance.
 
 ## Repository lifecycle
 
@@ -119,7 +124,9 @@ walgit init -repo /srv/git/origin.git -store /srv/walgit -id origin
 
 Every push is staged by `pre-receive` while Git's objects are quarantined. The
 `reference-transaction` hook publishes it only in Git's `prepared` phase, after
-the refs are locked but before they are committed or acknowledged.
+the refs are locked but before they are committed or acknowledged. That one
+index publication is the durable commit point. The later `committed` hook only
+marks the local cache current and performs no durable-store write.
 
 The gateway reconciles a local cache to the authoritative manifest before
 starting Git. It can be used by SSH as a forced command, or directly with Git:
@@ -141,8 +148,11 @@ walgit reconcile -repo /srv/git/origin.git -store /srv/walgit -id origin
 walgit restore -repo /srv/git/restored.git -store /srv/walgit -id origin
 ```
 
+### Historical certificate operations
+
 Dual-authority repositories can be verified and conservatively repaired with
-machine-readable commands. Repair requires an explicit, fully verified source:
+machine-readable commands. These commands apply only to the historical
+certificate experiment. Repair requires an explicit, fully verified source:
 
 ```sh
 export WALGIT_BLOB_SECONDARY_STORE=/mnt/independent-b/walgit
@@ -222,27 +232,29 @@ prefix. S3 conditional writes must be supported; a losing
 manifest writer receives a precondition failure, reloads the winner, and
 retries against the new ETag.
 
-Small WAL transactions and checkpoints are generated directly into a bounded
-stream while their SHA-256 digest is calculated from the same bytes. Object
-sets of 1 MiB or more use the blob path:
+Every normal WAL transaction is generated directly into one bounded stream
+while its SHA-256 digest is calculated from the same bytes:
 
 ```text
-Git quarantine file
-        │
-        ├── 8 MiB chunk ── SHA-256 ──┬──► primary blob authority
-        │                            └──► optional secondary authority
-        │
-        └── ordered chunk descriptor ───► tiny immutable WAL stub
+Git refs locked and objects quarantined
+                 │
+                 ▼
+       immutable WAL object in S3
+                 │
+                 ▼
+ GET index + ETag ──► validate expected refs
+                 │
+                 ▼
+       conditional PUT index (If-Match)
+                 │
+                 ▼
+      acknowledge; local repo is a cache
 ```
 
-At most four chunks upload concurrently, which bounds foreground chunk memory
-to 32 MiB per staged transaction. Chunks are stored by SHA-256 under
-`.walgit-blobs/sha256/<first-two-hex>/<digest>`, so retrying a partially
-completed upload reuses verified chunks and identical content is deduplicated
-within the store prefix. The complete transaction descriptor is itself a
-content-addressed blob. Existing inline WAL archives remain replayable.
-The on-disk format, publication sequence, configuration, recovery behavior,
-and GC constraints are detailed in [the blob-store design](docs/blob-store.md).
+Concurrent writers race the same conditional PUT. One wins; each loser reloads
+the index and retries against its new ETag. A persistent coordinator can append
+several consecutive entries with one conditional index update. There is no
+second finalize publication and no external database or witness.
 
 Neither S3 path uses a local temporary archive or local `fsync`. Uploads ask
 S3 to validate SHA-256 and compare a returned checksum when the provider
@@ -252,8 +264,8 @@ blindly overwrites it. A restarted writer performs the same recovery when its
 in-memory staged-object metadata is absent. Replay verifies every chunk and
 the reconstructed whole-file hash.
 
-To require every large payload and its descriptor to reach two independently
-configured blob stores before the WAL stub can be published:
+To experiment with content-addressed payload replication, configure both an
+explicit secondary and the replication requirement:
 
 ```sh
 export WALGIT_BLOB_SECONDARY_STORE=s3://independent-account/walgit-blobs
@@ -270,9 +282,15 @@ filesystem path or `file://` URI. A configured one-sided write fails the push;
 reads try the primary, verify the hash, and fall back to the secondary on a
 missing or corrupt chunk.
 
-`WALGIT_REQUIRE_BLOB_REPLICATION` protects only the large-object data plane.
-For a repository initialized from generation zero, enable hash-chained commit
-certificates as well:
+This option externalizes every transaction into 8 MiB chunks and a descriptor;
+it is not automatic in the normal path. It protects the payload data plane but
+does not replicate the authoritative index, so it is not by itself a complete
+provider-loss design. See [the blob-store experiment](docs/blob-store.md).
+
+### Historical dual-authority experiment
+
+The earlier hash-chained certificate implementation and `bench-dual` command
+remain available for comparison and disaster-recovery research:
 
 ```sh
 export WALGIT_BLOB_SECONDARY_STORE=s3://independent-account/walgit
@@ -283,8 +301,10 @@ export WALGIT_MIN_RETENTION=720h
 export WALGIT_RETENTION_MODE=compliance
 ```
 
-Dual-authority mode forces every transaction—including small and metadata-only
-rollbacks—through replicated content descriptors. Each commit certificate
+This is not the recommended or default architecture. It replaces S3 CAS with a
+single externally serialized writer and adds both providers to the commit path;
+it therefore cannot demonstrate Cursor-style any-node writes and has materially
+higher latency. Each experimental commit certificate
 contains its generation, previous certificate hash, certified transaction
 entries, resulting refs, repository configuration, and descriptor hashes. The
 identical immutable certificate must reach both authorities before the primary
@@ -299,7 +319,9 @@ their highest common valid chain is accepted, preventing a one-sided write from
 becoming authoritative. S3 certificate mode requires the included single
 repository writer because two unrelated object stores cannot atomically CAS one
 shared chain. See [the certificate protocol](docs/certificates.md) and
-[the reliability model](docs/reliability.md).
+[the reliability model](docs/reliability.md). New performance work must use the
+single-authority CAS path unless a benchmark explicitly studies this
+experiment.
 
 Existing repositories receive an explicit legacy anchor at their current
 generation. Fresh disaster restore before that generation is refused because
@@ -312,24 +334,23 @@ already exists.
 ### 4 MiB in-memory S3 stage benchmark
 
 The included benchmarks isolate archive/blob construction and upload-body
-delivery with a 4 MiB pack and in-memory S3 sinks. Five runs on an Apple M1 Max
-measured the following; this intentionally excludes network latency, TLS, and
-provider processing:
+delivery with a 4 MiB pack and in-memory S3 sinks. Three runs of the corrected
+build on an Apple M1 Max measured the following; this intentionally excludes
+network latency, TLS, and provider processing:
 
 | S3 stage implementation | Mean time | Throughput | Allocations |
 | --- | ---: | ---: | ---: |
 | Historical temporary file + sync + two rereads | 13.80 ms | 304 MB/s | 88 |
-| Historical one-pass monolithic stream | **2.66 ms** | **1,578 MB/s** | 80 |
-| Content-addressed chunks, one authority | 3.76 ms | 1,115 MB/s | 157 |
-| Content-addressed chunks, two concurrent authorities | 3.79 ms | 1,106 MB/s | 207 |
+| Current normal one-pass monolithic stream | **2.44 ms** | **1,716 MB/s** | 82 |
+| Opt-in content-addressed chunks, one authority | 3.74 ms | 1,122 MB/s | 133 |
+| Content-addressed chunks, two concurrent authorities | 3.80 ms | 1,105 MB/s | 183 |
 
-The current one-authority blob path is 3.7x faster than the original temporary
-archive path. Its extra whole-file/chunk hashing, descriptor, and requests cost
-about 41% relative to the simpler monolithic stream. Concurrent fanout added
-less than 1% with memory sinks; over a real network, acknowledgement waits for
-the slower authority. This stage microbenchmark does not include the two parent
-certificate reads, two certificate writes, or primary manifest write in the
-commit phase. Run both current variants on the target host with:
+The normal monolithic path is 5.6x faster than the original temporary-archive
+path in this CPU/memory-only test. Opt-in chunking adds about 53% relative to
+the normal path. Concurrent fanout added about 1.6% with memory sinks; over a
+real network, acknowledgement waits for the slower authority. This stage
+microbenchmark excludes network latency and the index read/CAS. Run the
+variants on the target host with:
 
 ```sh
 go test ./internal/wal -run '^$' \
@@ -539,16 +560,17 @@ reconstructs refs and objects from the latest checkpoint plus WAL tail.
 - Reference-transaction notifications for symbolic `HEAD`, emitted by newer
   Git versions such as 2.43, are ignored while every actual `refs/*` update
   remains strictly parsed and validated against the staged transaction.
-- Conditional-CAS updates remain marked as prepared and lock their touched refs
-  until Git reports `committed` or `aborted`.
-- A coordinated single writer uses manifest publication itself as the durable
-  commit point and keeps serialization state in memory, eliminating a second
-  foreground manifest update.
-- A normal abort appends an immutable inverse WAL transaction before releasing
-  its locks, so a failed push cannot survive as an authoritative ref update.
-- Prepared transactions left by a process or network failure are presumed
-  committed after five minutes; this bounds unavailable locks while making the
-  distributed commit point explicit for client-disconnect ambiguity.
+- The WAL index is the single durable commit point. Its one conditional update
+  both orders and publishes the push.
+- Git's later `committed` notification performs no durable-store I/O. If the
+  local cache aborts after index publication, reconciliation repairs or replaces
+  that cache; it does not roll back authoritative history.
+- A lost response after a successful conditional PUT is an unknown client
+  outcome, not an unknown repository state. The index is authoritative and the
+  transaction identity makes retry idempotent.
+- Older version-2 manifests may contain `prepared` records from the retired
+  two-publication protocol. New normal commits clear them; they are not used as
+  locks by the current protocol.
 - A local generation marker is written only after the cache matches the
   manifest.
 - Reconciliation is idempotent across crashes between object extraction, ref
@@ -567,9 +589,9 @@ reconstructs refs and objects from the latest checkpoint plus WAL tail.
 - Transient pack locks, keep files, and replay temporary files are never copied
   into WAL entries or checkpoints.
 - WAL and checkpoint contents are protected by SHA-256 checksums.
-- Large object sets use ordered 8 MiB content-addressed chunks plus a
-  whole-file checksum. With a secondary configured, both chunk authorities
-  must acknowledge every chunk and the external descriptor before publication.
+- Explicit blob-replication mode uses ordered 8 MiB content-addressed chunks
+  plus a whole-file checksum. Both configured chunk authorities must
+  acknowledge every chunk and descriptor before index publication.
 - Filesystem manifest publication uses an advisory lock plus atomic rename.
   File contents are synced before rename and the containing directory is
   synced afterward. A checkpoint directory is synced before a manifest may
@@ -590,11 +612,12 @@ reconstructs refs and objects from the latest checkpoint plus WAL tail.
 
 Set `WALGIT_FAILPOINT` to a comma-separated selection of `stage.after_sync`,
 `commit.after_entry_rename`, `commit.after_manifest`,
-`finalize.before_manifest`, `finalize.after_manifest`,
-`rollback.after_entry_rename`, or `rollback.after_manifest` to inject failures
-at durability boundaries. The integration suite drives real pushes through
-these phases and verifies the local refs, manifest, compensation log, retry,
-and reconstruction behavior.
+`s3.stage.before_wal_upload`, `s3.stage.after_wal_upload`,
+`s3.commit.before_index_cas`, or `s3.commit.after_index_cas` to inject failures
+at normal durability boundaries. The integration suite verifies orphan safety,
+the authoritative index, lost-success retry, and reconstruction behavior.
+Additional rollback/finalize failpoints remain for the historical certificate
+experiment.
 
 ## Current boundary
 
@@ -606,20 +629,19 @@ DigitalOcean Spaces uses the included per-repository writer coordinator because
 its object API cannot perform the required manifest CAS. The coordinator does
 not yet have distributed leases or automatic primary failover, so operators
 must ensure that only one instance is active for a Spaces-backed repository.
-One S3 bucket is still one administrative failure domain. With
-`WALGIT_REQUIRE_DUAL_AUTHORITY`, new repositories retain independently
-replayable data and hash-chained ordering in both authorities and can recover
-after complete primary-manifest/WAL/blob loss. `walgit scrub` now verifies both
-complete copies, and `walgit repair` restores a damaged peer from an explicitly
-selected healthy source using a separately credentialed, audited path. The
-server can schedule scrubs, stop writes and maintenance on failure, fail
-readiness, and expose alertable metrics. Strict S3 validates retention and adds
-explicit Object Lock retention to immutable writes. Operators must still use
-independently administered accounts, connect the metrics to alerting, and run
-disaster-restore drills. Without those controls, undetected deletion on one
-authority followed by loss of the other can still defeat the guarantee.
-Ordinary provider replication, versioning, or RAID alone must not be described
-as equivalent.
+One S3 bucket is still one administrative failure domain. The normal prototype
+does not yet mirror the complete WAL and committed index history into a second
+independently restorable authority. Versioning, Object Lock, restricted
+credentials, continuous verification, and tested backups are deployment
+requirements, not reasons to claim literal impossibility of data loss.
+
+The historical `WALGIT_REQUIRE_DUAL_AUTHORITY` experiment can independently
+replay one surviving certificate authority, and its scrub/repair/drill tools
+remain in the repository. It is deliberately excluded from the normal hot path
+because it abandons any-node S3 CAS, requires a single writer, and regressed
+latency. A future provider-loss design should mirror immutable WAL and committed
+index snapshots without becoming a second ordering authority.
+
 There is no built-in service discovery, rendezvous-hash router, gossip, or
 cache warming. The system also has no Git LFS protocol integration,
 admission-control

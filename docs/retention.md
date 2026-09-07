@@ -1,5 +1,10 @@
 # S3 retention policy
 
+This runbook currently applies to the historical dual-authority certificate
+experiment. Normal single-index S3 deployments should still use versioning,
+Object Lock, and least-privilege credentials, but the prototype does not yet
+validate or mirror the complete normal WAL/index history across providers.
+
 Dual copies only protect data while failures are detected and repaired before
 they overlap. Strict dual-authority S3 therefore fails closed unless both
 buckets prove all of the following:

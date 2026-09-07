@@ -1,9 +1,9 @@
 # Content-addressed blob store
 
-Walgit's blob path makes large Git object payloads independently retryable,
-deduplicated, verifiable, and replicable. It is used automatically when the
-non-transient files in a staged object directory total at least 1 MiB. Smaller
-transactions keep the lower-overhead inline WAL representation.
+Walgit's blob path is an opt-in experiment that makes Git object payloads
+independently retryable, deduplicated, verifiable, and replicable. The normal
+Cursor-style path keeps every transaction in one lower-overhead streamed WAL
+object. Blob externalization is enabled only by an explicit replication mode.
 
 ## Format and publication
 
@@ -33,10 +33,8 @@ Publication order is:
 2. Wait for every configured blob authority to verify every chunk.
 3. Store and verify the external transaction descriptor in every authority.
 4. Publish the immutable WAL stub to the primary store.
-5. In dual-authority mode, publish the hash-chained commit certificate to both
-   authorities.
-6. Publish the primary manifest update using its single-writer rule.
-7. Acknowledge the Git reference transaction only after those boundaries.
+5. Publish the primary WAL index under its configured ordering rule.
+6. Acknowledge the Git reference transaction only after those boundaries.
 
 A failed or crashed attempt can leave unreferenced chunks, but cannot publish a
 manifest that references a chunk which the configured blob boundary did not
@@ -91,12 +89,10 @@ repair is not: immutable foreground credentials should not be able to replace
 a corrupt object, and choosing a repair source belongs in an audited,
 privileged scrubber.
 
-Set `WALGIT_REQUIRE_DUAL_AUTHORITY=true` instead of the blob-only requirement
-when commit ordering must also survive primary loss. This forces small and
-metadata-only transactions into the blob path and certifies their descriptors
-on both stores. S3 deployments must also use the repository-scoped single
-writer. The full format and recovery rules are in
-[the certificate protocol](certificates.md).
+This mode does not replicate the authoritative WAL index and therefore cannot
+independently restore a repository after complete loss of the primary. The
+historical certificate experiment attempted that stronger boundary, but it is
+not part of the normal architecture; see [the certificate experiment](certificates.md).
 
 ## Recovery and compatibility
 
@@ -118,18 +114,13 @@ security domain a separate prefix; sharing content-addressed existence across
 untrusted tenants can create a content-presence side channel.
 
 The prototype does not delete content-addressed blobs. Safe reclamation needs a
-dual-authority mark phase over retained checkpoints, the WAL tail, prepared
-transactions, and retention windows, followed by an independently verified
-sweep. Until then, leaking an orphan created by a failed upload is the safe
-choice.
+mark phase over retained checkpoints, the WAL tail, and retention windows,
+followed by a verified sweep. Until then, leaking an orphan created by a failed
+upload is the safe choice.
 
 ## Remaining operational boundary
 
-The certificate protocol preserves independently replayable ordering and
-payloads across primary loss for repositories initialized in dual-authority
-mode. `walgit scrub` supports continuous verification of both copies, and
-`walgit repair` provides a conservative, separately credentialed repair path;
-see the [runbook](scrub-repair.md). Independently enforced retention and
-recurring disaster-restore drills remain required. S3 retention enforcement is
-described in the [retention runbook](retention.md). See the
-[reliability model](reliability.md) for the exact boundary.
+This experiment currently protects payload copies, not complete repository
+ordering. Do not claim provider-loss recovery from blob replication alone. See
+the [reliability model](reliability.md) for the exact normal boundary and the
+remaining provider-loss work.

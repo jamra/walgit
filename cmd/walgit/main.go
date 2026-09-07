@@ -183,7 +183,7 @@ func main() {
 			}
 			err = app.BenchmarkNodesAtStore(*nodes, *pushes, *bytes, *benchmarkStore, *keep, os.Stdout)
 		} else {
-			err = app.Benchmark(*pushes, *bytes, *keep, os.Stdout)
+			err = app.BenchmarkWithWriter(*pushes, *bytes, *keep, *persistentWriter, os.Stdout)
 		}
 	case "bench-dual":
 		fs := flag.NewFlagSet("bench-dual", flag.ExitOnError)

@@ -1,219 +1,144 @@
 # Reliability model
 
-This document distinguishes properties walgit enforces in code from
-properties that require deployment policy. The governing rule is:
+Walgit's normal protocol follows one rule:
 
-> Walgit must never acknowledge a Git update unless every object needed to
-> reconstruct it has crossed the configured durable commit boundary.
+> An index may reference a transaction only after its immutable WAL object is
+> durably accepted and verified by the configured S3 authority.
 
-## Implemented boundaries
+The WAL index is the only ordering authority. Bare Git repositories are caches.
+There is no PostgreSQL database, witness, certificate quorum, or cross-provider
+consensus operation in the normal push path.
 
-### Filesystem backend
-
-A durable file is published in this order:
-
-1. Write a temporary file and check every write.
-2. Sync the file and check the result.
-3. Close the file and check the result.
-4. Atomically rename it into place.
-5. Sync the containing directory.
-6. Only then publish or acknowledge state that references it.
-
-Checkpoint files use the same protocol. In particular, the `checkpoints`
-directory is synced before the repository manifest may reference a checkpoint.
-
-An error at a write, close, file-sync, directory-sync, or persistence-class
-rename boundary poisons the store. The running process refuses further reads and writes, and a
-best-effort `.walgit-poisoned` marker makes later hook processes fail closed.
-A later successful `fsync` is not treated as proof that data from the failed
-writeback survived. This is the failure mode commonly called
-[fsyncgate](https://wiki.postgresql.org/wiki/Fsync_Errors).
-
-Recovery requires replacing or repairing the faulty storage, reconstructing
-the store from an independent durable authority, validating all hashes and Git
-objects, removing the poison marker, and restarting the process. Never automate
-marker removal without those checks.
-
-### S3-compatible backend
-
-Small object sets remain on the original no-spool path:
+## Normal commit protocol
 
 ```text
-Git quarantine files
-        │
-        ▼
-256 KiB reusable buffer ──► tar encoder ──► SHA-256 ──► S3 WAL object
+Git prepares and locks refs
+          │
+          ▼
+stream immutable WAL object to S3 and hash it
+          │
+          ▼
+GET index and ETag; validate expected old refs
+          │
+          ▼
+conditional PUT(index, If-Match: ETag)
+          │
+          ▼
+index is committed ──► Git finishes its local cache transaction
 ```
 
-At 1 MiB and above, the content-addressed path avoids turning the entire pack
-into one retry and replication unit:
+The WAL object contains the reference transaction and quarantined Git objects.
+Its key is immutable and derived from the transaction identity. A retry after a
+timeout reads, parses, and hashes an existing object before accepting it.
 
-```text
-Git quarantine file
-        │
-        ├── 8 MiB chunk ── SHA-256 ──┬──► authority A
-        │                            └──► authority B (when configured)
-        │
-        ├── whole-file SHA-256
-        ▼
-ordered descriptor ── SHA-256 ──────► both authorities
-        │
-        ▼
-tiny WAL stub ──────────────────────► primary authority
-```
+The conditional index update is atomic. Concurrent writers may upload
+independent WAL objects, but only one can replace a particular ETag. A loser
+reloads the winning index, validates its expected old refs, and retries. A
+persistent coordinator may put several consecutive entries into one index CAS.
 
-The uploader has at most four 8 MiB buffers in flight. Chunk keys are derived
-only from a validated lowercase SHA-256 digest. Creation is immutable. A retry
-that encounters an existing chunk reads and validates it before treating the
-write as successful, covering both deduplication and a lost success response.
-Replay validates each chunk's size and digest, then validates the reconstructed
-file's size and whole-file digest before atomically publishing it to the cache.
+The later Git `committed` hook does not publish anything remotely. If the local
+Git transaction fails after the index CAS, the index remains authoritative and
+the disposable cache is reconciled or rebuilt. Rolling the index back would be
+unsafe because another writer may already have committed a successor.
 
-When `WALGIT_BLOB_SECONDARY_STORE` is configured, foreground writes fan out to
-both blob authorities concurrently and succeed only if both accept or already
-contain the verified chunk. Reads verify the primary and fall back to the
-secondary. Walgit does not let foreground writer credentials overwrite a
-corrupt immutable object; privileged repair is intentionally a separate future
-responsibility.
+## Crash boundaries
 
-The WAL request also asks the provider to validate SHA-256. Walgit compares a
-returned checksum when one is supplied and records its independently calculated
-digest in the manifest. A timeout is ambiguous: the provider might have durably
-stored the object before the response was lost. Because transaction objects are
-immutable, walgit resolves this by downloading, parsing, and hashing the object.
-It publishes the manifest only after that validation succeeds.
-
-The same validation allows a restarted coordinator, which has lost its memory
-cache, to safely recover a staged transaction. Replay always recalculates and
-checks the manifest digest before applying reference updates. Inline archives
-created before the blob format remain readable.
-
-### Dual-authority certificates
-
-With `WALGIT_REQUIRE_DUAL_AUTHORITY=true`, the durable commit path is:
-
-```text
-all chunks + transaction descriptor
-        │
-        ├──────────────► authority A (verified)
-        └──────────────► authority B (verified)
-                              │
-previous certificate hash + entries + resulting refs
-        │
-        ├──────────────► authority A (immutable certificate)
-        └──────────────► authority B (immutable certificate)
-                              │
-                              ▼
-                     primary manifest cache
-                              │
-                              ▼
-                       acknowledge Git
-```
-
-Every transaction is externalized in this mode, including small pushes and
-metadata-only rollback records. A certificate is a SHA-256-addressed immutable
-link containing the prior certificate hash, consecutive generation entries,
-their descriptor hashes and ref updates, and the resulting complete ref map.
-The immediate parent is re-read and verified on each authority before a child
-is stored. Both child writes must verify before primary-manifest publication.
-
-The primary manifest can be reconstructed from the chain. Replay uses certified
-descriptors when primary WAL objects are unavailable. When both authorities are
-readable, only their highest common valid chain is accepted; when one has been
-lost, the survivor's fully validated chain is recoverable. S3 uses one
-repository-scoped writer because two object stores cannot perform one atomic
-cross-provider CAS. Full rules and the unavoidable unknown-outcome-tail case are
-documented in [the certificate protocol](certificates.md).
-
-### Serving caches
-
-Git repositories on serving nodes are reconstructible caches, not authority.
-Walgit nevertheless prevents a durable generation marker from claiming objects
-whose directory entries could disappear in the same crash:
-
-- extracted files are synced before rename;
-- affected object directories are synced from leaf to root;
-- Git uses `core.fsync=committed` and `core.fsyncMethod=fsync`;
-- the generation marker is written, synced, renamed, and followed by a parent
-  directory sync.
-
-If cache verification fails, discard and reconstruct the cache from checkpoint
-plus WAL rather than attempting an in-place repair.
-
-## Failure behavior
-
-| Failure | Result |
+| Failure boundary | Authoritative result |
 | --- | --- |
-| Process exits before S3 object success | Push fails; no manifest reference |
-| S3 stores object but response is lost | Immutable object is read and verified before continuing |
-| Process exits after object but before manifest | Orphan remains safe; retry recovers it |
-| One blob authority rejects or loses a write | Push fails before WAL publication |
-| Primary blob copy is missing or corrupt | Verified secondary copy is used |
-| Both blob copies are missing or corrupt | Replay fails closed; refs do not advance |
-| One certificate write fails | Push fails; highest common chain does not advance |
-| Both certificates succeed but manifest publication is lost | Retry recovers the certified commit; client had an unknown outcome |
-| Primary manifest, WAL, and blobs are lost | Survivor certificate chain and descriptors reconstruct the repository |
-| Certificate chains disagree while both are readable | Only their highest common valid chain is selected |
-| A certificate chain is corrupt on both sides | Recovery fails closed |
-| Checksum or archive validation fails | No manifest publication or acknowledgement |
-| Manifest CAS loses a race | Reload winner and retry against its ETag |
-| Filesystem sync reports an error | Entire store is poisoned; no retry in that process |
-| Crash after checkpoint rename | Synced checkpoint is either unreferenced or safely referenced |
-| Crash while reconstructing a cache | Generation does not advance; replay is idempotent |
+| Before WAL upload | No transaction exists and the index is unchanged |
+| During WAL upload | No index reference; an incomplete provider request fails |
+| After WAL upload, before index CAS | Verified orphan WAL; index unchanged; retry is safe |
+| CAS loses to another writer | Reload, revalidate, and retry; no lost update |
+| CAS succeeds but its response is lost | Index contains the commit; retry finds the transaction and performs no write |
+| Local Git cache aborts after CAS | Index remains committed; reconcile repairs the cache |
+| Process exits before client acknowledgement | Client outcome may be unknown, but repository state is determined by the index |
 
-## Strict no-loss deployment
+Deterministic tests cover the before/after WAL and before/after index boundaries,
+lost-success retry, independent-writer CAS races, and zero-I/O finalization.
 
-The code now enforces the foreground half of the stronger policy for
-repositories initialized with dual-authority mode:
+## Filesystem backend and fsync errors
 
-1. Store every transaction's chunks and descriptor in two authorities.
-2. Validate immutable existing objects and fall back to a verified secondary.
-3. Store a hash-chained commit certificate in both authorities before success.
-4. Reject one-sided writes and select only the common chain while both sides are
-   readable.
-5. Reconstruct refs, ordering, and objects from one surviving authority after
-   complete primary manifest/WAL/blob loss.
-6. Preserve abort semantics with a certified compensation entry.
+The filesystem backend is a correctness and performance baseline, not the
+distributed production design. It publishes a durable file by:
 
-This means loss of one complete authority does not lose an acknowledged commit,
-provided the other still retains its acknowledged objects. Two copies alone do
-not make that statement timeless. The remaining operational protocol is:
+1. writing a temporary file and checking every write;
+2. syncing and closing the file;
+3. atomically renaming it;
+4. syncing the containing directory; and
+5. publishing the manifest only after the WAL is durable.
 
-1. Enable versioning and retention/Object Lock independently on both sides,
-   using credentials that cannot shorten retention or delete retained data.
-   Strict S3 startup validates this policy and sends explicit retention on
-   immutable writes; see the [retention runbook](retention.md).
-2. Continuously run `walgit scrub` against both copies and alert on any nonzero
-   result.
-3. Stop the repository writer and use `walgit repair` with separately
-   privileged credentials to copy and verify missing chunks, descriptors, and
-   certificate links before another failure can overlap. The exact procedure
-   is in the [scrub and repair runbook](scrub-repair.md).
-4. Regularly run `walgit drill` from each authority. The drill reads only the
-   selected provider, reconstructs an empty repository, and requires
-   `git fsck --strict`; see the [disaster drill guide](disaster-drills.md).
-5. Exercise restoration in a separate account and run `git fsck --strict`.
-6. Add a certified checkpoint migration before claiming full-history protection
-   for a repository anchored above generation zero.
+Any write, close, file-sync, directory-sync, or persistence-class rename error
+poisons the store. The current process refuses later operations and writes a
+best-effort `.walgit-poisoned` marker so new processes also fail closed. A later
+successful sync is not evidence that an earlier failed writeback survived. This
+is the class of failure described by PostgreSQL's
+[fsyncgate investigation](https://wiki.postgresql.org/wiki/Fsync_Errors).
 
-If one authority disappears, a survivor-only tail could be an unacknowledged
-write whose peer failed just before success. Recovering it avoids acknowledged
-data loss but can expose an extra unknown-outcome commit. Avoiding both outcomes
-requires a third witness or consensus quorum; see the protocol document.
+Recovery means replacing or repairing the faulty storage, reconstructing and
+verifying it from an independent copy, and only then explicitly removing the
+poison marker. Marker removal must not be automated as error recovery.
 
-Ordinary same-provider replication, RAID, snapshots controlled by the same
-credentials, or a successful local `fsync` are useful layers, but they are not
-substitutes for two independent durable authorities.
+## S3 assumptions and limits
 
-## Required destructive-operation policy
+The normal S3 mode depends on:
 
-- Garbage collection must retain data until both authorities confirm that a
-  newer checkpoint and its complete WAL tail are durable.
-- The current prototype never garbage-collects content-addressed blobs. Leaked
-  orphan chunks are preferable to deleting a live chunk before dual-authority
-  reachability is implemented.
-- Deletion credentials must be separate from foreground writer credentials.
-- Retention must exceed the longest credible detection and recovery window.
-- A configured server scrub mismatch stops writes, readiness, and garbage
-  collection and exposes alertable metrics; repair never chooses a winner
-  silently.
+- strong read-after-write consistency for objects;
+- atomic single-key replacement;
+- `If-Match`/`If-None-Match` conditional writes;
+- durable acknowledgement and provider-side redundancy; and
+- credentials and bucket policies that prevent unauthorized mutation.
+
+AWS S3 provides the required conditional writes. An S3-compatible provider must
+be verified rather than assumed. DigitalOcean Spaces does not currently expose
+conditional `PutObject`, so its compatibility mode requires exactly one fenced,
+externally supervised coordinator per repository. Starting two coordinators in
+that mode can lose updates.
+
+One S3 authority is highly durable against ordinary device, host, and
+availability-zone failures, but no software can literally promise that data can
+never be lost. Complete account compromise, destructive credentials, a provider
+control-plane failure, or deletion after retention expires remain outside one
+authority's boundary. Versioning, Object Lock, least-privilege credentials,
+continuous verification, and tested offline or independent backups are still
+required for a serious no-data-loss objective.
+
+## Content-addressed replication experiment
+
+`WALGIT_REQUIRE_BLOB_REPLICATION=true` plus
+`WALGIT_BLOB_SECONDARY_STORE` externalizes each transaction into verified 8 MiB
+chunks and writes them to two stores before the primary WAL stub is published.
+This protects payload copies and supports verified fallback. It does not copy
+the authoritative index, so it is not a complete provider-loss protocol.
+
+Normal transactions stay monolithic because the measured in-memory 4 MiB stage
+cost was 2.44 ms versus 3.74 ms for one-authority chunking. Chunking belongs
+behind an explicit requirement until large-pack retry behavior justifies its
+53% local processing cost.
+
+## Historical certificate experiment
+
+The codebase retains `WALGIT_REQUIRE_DUAL_AUTHORITY` and `bench-dual` so the
+earlier two-provider certificate design remains reproducible. That mode is not
+the normal architecture: it disables S3 CAS, requires one external writer, and
+puts both providers plus certificate validation in the foreground commit path.
+It should not be used when reporting normal walgit performance.
+
+The experiment's scrub, repair, retention, and independent restore tools remain
+useful research artifacts. Their protocol and limitations are documented in
+[certificates.md](certificates.md), [scrub-repair.md](scrub-repair.md), and
+[disaster-drills.md](disaster-drills.md).
+
+## Performance acceptance rules
+
+Correctness tests also guard the request shape of the hot path:
+
+- one index GET and one conditional index PUT per unbatched commit;
+- zero remote calls for finalization;
+- one streamed WAL object by default, including payloads above 1 MiB;
+- no content-addressed chunking unless explicitly configured; and
+- independent writers must converge through CAS without losing disjoint refs.
+
+End-to-end benchmarks must report raw Git and walgit from the same run, include
+mean, p50, p90, p99, and worst case, and separate direct hooks from persistent
+writer mode. A performance regression greater than 5% should not be accepted
+without an explained reliability or functionality tradeoff.

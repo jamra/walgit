@@ -14,6 +14,7 @@ func TestBlobBackedWALChunksReplicatesDeduplicatesAndRestores(t *testing.T) {
 	primary := NewMemoryBlobStore()
 	secondary := NewMemoryBlobStore()
 	store.blobs = replicatedBlobStore{stores: []blobStore{primary, secondary}}
+	store.externalizeTransactions = true
 
 	large := bytes.Repeat([]byte("a"), 2*blobChunkSize+12345)
 	large[blobChunkSize] = 'b'
@@ -99,6 +100,7 @@ func TestReplicatedBlobReadFallsBackFromCorruptAuthority(t *testing.T) {
 	primary := NewMemoryBlobStore()
 	secondary := NewMemoryBlobStore()
 	store.blobs = replicatedBlobStore{stores: []blobStore{primary, secondary}}
+	store.externalizeTransactions = true
 	if err := store.Stage(id, objects, updates); err != nil {
 		t.Fatal(err)
 	}
@@ -127,6 +129,7 @@ func TestReplicatedBlobWriteRequiresEveryAuthority(t *testing.T) {
 	}
 	primary := NewMemoryBlobStore()
 	store.blobs = replicatedBlobStore{stores: []blobStore{primary, failingBlobStore{}}}
+	store.externalizeTransactions = true
 	if err := store.Stage(id, objects, updates); err == nil || !strings.Contains(err.Error(), "every durable authority") {
 		t.Fatalf("stage acknowledged a one-sided blob write: %v", err)
 	}
@@ -150,6 +153,7 @@ func TestRequireBlobReplicationFailsClosedWithoutSecondary(t *testing.T) {
 func TestBlobReplicationRejectsSameFilesystemThroughAlias(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "store")
 	t.Setenv("WALGIT_BLOB_SECONDARY_STORE", "file://"+root)
+	t.Setenv("WALGIT_REQUIRE_BLOB_REPLICATION", "true")
 	if _, err := Open(root); err == nil || !strings.Contains(err.Error(), "different locations") {
 		t.Fatalf("same blob authority was accepted twice: %v", err)
 	}

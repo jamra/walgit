@@ -282,6 +282,7 @@ func reconcileForGateway(repo, store, id string) error {
 type benchmarkResult struct {
 	Pushes                  int            `json:"pushes"`
 	BlobBytes               int            `json:"blob_bytes"`
+	PersistentWriter        bool           `json:"persistent_writer"`
 	WALLatency              latencySummary `json:"wal_latency_ms"`
 	PlainLatency            latencySummary `json:"plain_latency_ms"`
 	WALPushesPerSecond      float64        `json:"wal_pushes_per_second"`
@@ -306,6 +307,10 @@ type latencySummary struct {
 }
 
 func Benchmark(pushes, blobBytes int, keep bool, output io.Writer) error {
+	return BenchmarkWithWriter(pushes, blobBytes, keep, false, output)
+}
+
+func BenchmarkWithWriter(pushes, blobBytes int, keep, persistentWriter bool, output io.Writer) error {
 	if pushes < 1 || blobBytes < 1 {
 		return errors.New("pushes and blob-bytes must be positive")
 	}
@@ -324,6 +329,29 @@ func Benchmark(pushes, blobBytes int, keep bool, output io.Writer) error {
 	checkpointRestored := filepath.Join(root, "checkpoint-restored.git")
 	if err := Init(remote, store, "bench"); err != nil {
 		return err
+	}
+	var writer *WriterHandle
+	if persistentWriter {
+		socket := filepath.Join(root, "writer.sock")
+		writer, err = StartWriter(socket, store, "bench", 2*time.Millisecond, 64)
+		if err != nil {
+			return err
+		}
+		previousSocket, hadSocket := os.LookupEnv(writerSocketEnvironment)
+		if err := os.Setenv(writerSocketEnvironment, socket); err != nil {
+			_ = writer.Close()
+			return err
+		}
+		defer func() {
+			if writer != nil {
+				_ = writer.Close()
+			}
+			if hadSocket {
+				_ = os.Setenv(writerSocketEnvironment, previousSocket)
+			} else {
+				_ = os.Unsetenv(writerSocketEnvironment)
+			}
+		}()
 	}
 	if err := run("", "git", "init", "--bare", plain); err != nil {
 		return err
@@ -370,6 +398,15 @@ func Benchmark(pushes, blobBytes int, keep bool, output io.Writer) error {
 			return fmt.Errorf("push %d: %w", i+1, err)
 		}
 		walSamples = append(walSamples, time.Since(started))
+	}
+	if writer != nil {
+		if err := writer.Close(); err != nil {
+			return err
+		}
+		writer = nil
+		if err := os.Unsetenv(writerSocketEnvironment); err != nil {
+			return err
+		}
 	}
 	restoreStarted := time.Now()
 	if err := Restore(restored, store, "bench"); err != nil {
@@ -430,6 +467,7 @@ func Benchmark(pushes, blobBytes int, keep bool, output io.Writer) error {
 	result := benchmarkResult{
 		Pushes:                  pushes,
 		BlobBytes:               blobBytes,
+		PersistentWriter:        persistentWriter,
 		WALLatency:              walLatency,
 		PlainLatency:            plainLatency,
 		WALPushesPerSecond:      float64(pushes) / walElapsed.Seconds(),

@@ -40,19 +40,20 @@ type s3VersionCleanupClient interface {
 }
 
 type S3Store struct {
-	client              s3Client
-	bucket              string
-	prefix              string
-	timeout             time.Duration
-	unconditionalWrites bool
-	stateMu             sync.Mutex
-	staged              map[string]stagedS3Transaction
-	cachedManifest      *Manifest
-	cachedETag          string
-	blobs               blobStore
-	certificates        certificateStore
-	retentionMode       types.ObjectLockMode
-	retentionFor        time.Duration
+	client                  s3Client
+	bucket                  string
+	prefix                  string
+	timeout                 time.Duration
+	unconditionalWrites     bool
+	stateMu                 sync.Mutex
+	staged                  map[string]stagedS3Transaction
+	cachedManifest          *Manifest
+	cachedETag              string
+	blobs                   blobStore
+	certificates            certificateStore
+	externalizeTransactions bool
+	retentionMode           types.ObjectLockMode
+	retentionFor            time.Duration
 }
 
 type stagedS3Transaction struct {
@@ -184,7 +185,7 @@ func OpenS3(location string) (Backend, error) {
 		return nil, err
 	}
 	primary := s3BlobStore{store: store}
-	blobs, certificates, err := configureDurability(primary, location)
+	blobs, certificates, externalizeTransactions, err := configureDurability(primary, location)
 	if err != nil {
 		return nil, err
 	}
@@ -199,6 +200,7 @@ func OpenS3(location string) (Backend, error) {
 	}
 	store.blobs = blobs
 	store.certificates = certificates
+	store.externalizeTransactions = externalizeTransactions
 	return store, nil
 }
 
@@ -363,10 +365,8 @@ func (s *S3Store) Stage(repoID, objectDir string, updates []RefUpdate) error {
 		return err
 	}
 	var objects []ObjectBlob
-	if s.certificates != nil {
+	if s.certificates != nil || s.externalizeTransactions {
 		objects, err = storeObjectBlobs(objectDir, s.blobStorage())
-	} else {
-		objects, err = maybeStoreObjectBlobs(objectDir, s.blobStorage())
 	}
 	if err != nil {
 		return err
@@ -380,6 +380,9 @@ func (s *S3Store) Stage(repoID, objectDir string, updates []RefUpdate) error {
 	}
 	usedDescriptor := meta.Descriptor
 	payloadBytes := objectBlobBytes(objects)
+	if err := failpoint("s3.stage.before_wal_upload"); err != nil {
+		return err
+	}
 	object, err := s.putStreamedObject(repoID, "transactions/"+txID+".wal", func(w io.Writer) error {
 		return writeArchive(w, meta, objectDir)
 	}, func(r io.Reader) error {
@@ -399,6 +402,9 @@ func (s *S3Store) Stage(repoID, objectDir string, updates []RefUpdate) error {
 		return nil
 	})
 	if err != nil {
+		return err
+	}
+	if err := failpoint("s3.stage.after_wal_upload"); err != nil {
 		return err
 	}
 	object.payloadBytes = payloadBytes
@@ -503,8 +509,10 @@ func (s *S3Store) CommitBatch(repoID string, batches [][]RefUpdate) ([]ManifestE
 				entries[batchIndex] = entry
 				continue
 			}
-			if err := validatePreparedLocks(m, batch.txID, batch.updates); err != nil {
-				return nil, Manifest{}, err
+			if s.certificates != nil && !s.unconditionalWrites {
+				if err := validatePreparedLocks(m, batch.txID, batch.updates); err != nil {
+					return nil, Manifest{}, err
+				}
 			}
 			if err := validateUpdates(m, batch.updates); err != nil {
 				return nil, Manifest{}, err
@@ -524,13 +532,15 @@ func (s *S3Store) CommitBatch(repoID string, batches [][]RefUpdate) ([]ManifestE
 			}
 			m.Generation = generation
 			m.Entries = append(m.Entries, entry)
-			if !s.unconditionalWrites {
+			if s.certificates != nil && !s.unconditionalWrites {
 				if m.Prepared == nil {
 					m.Prepared = make(map[string]PreparedTransaction)
 				}
 				m.Prepared[batch.txID] = PreparedTransaction{
 					TransactionID: batch.txID, Generation: generation, CreatedAt: time.Now().UTC(), Updates: batch.updates,
 				}
+			} else {
+				m.Prepared = nil
 			}
 			entries[batchIndex] = entry
 			certified = append(certified, CertificateEntry{Entry: entry, Updates: batch.updates})
@@ -548,10 +558,16 @@ func (s *S3Store) CommitBatch(repoID string, batches [][]RefUpdate) ([]ManifestE
 		if err != nil {
 			return nil, Manifest{}, err
 		}
+		if err := failpoint("s3.commit.before_index_cas"); err != nil {
+			return nil, Manifest{}, err
+		}
 		if err := s.putManifest(repoID, m, etag, false); isPrecondition(err) || isConflict(err) {
 			s.cachedManifest = nil
 			continue
 		} else if err != nil {
+			return nil, Manifest{}, err
+		}
+		if err := failpoint("s3.commit.after_index_cas"); err != nil {
 			return nil, Manifest{}, err
 		}
 		if s.unconditionalWrites {
@@ -565,8 +581,8 @@ func (s *S3Store) CommitBatch(repoID string, batches [][]RefUpdate) ([]ManifestE
 }
 
 func (s *S3Store) Finalize(repoID string, updates []RefUpdate) error {
-	if s.unconditionalWrites {
-		return nil // Coordinated manifest publication is the durable commit point.
+	if s.certificates == nil || s.unconditionalWrites {
+		return nil // Atomic index publication is the durable commit point.
 	}
 	txID, err := transactionID(updates)
 	if err != nil {
@@ -595,6 +611,11 @@ func (s *S3Store) Finalize(repoID string, updates []RefUpdate) error {
 }
 
 func (s *S3Store) Abort(repoID string, updates []RefUpdate) error {
+	if s.certificates == nil {
+		// A published index entry stays authoritative. The local Git repository
+		// is a cache and is repaired by reconciliation after an abort/crash.
+		return nil
+	}
 	if s.unconditionalWrites {
 		return s.abortCoordinated(repoID, updates)
 	}

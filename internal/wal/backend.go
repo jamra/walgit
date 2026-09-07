@@ -65,40 +65,44 @@ func Open(location string) (Backend, error) {
 		return nil, err
 	}
 	store := Store{Root: root}
-	blobs, certificates, err := configureDurability(filesystemBlobStore{store: store}, location)
+	blobs, certificates, externalizeTransactions, err := configureDurability(filesystemBlobStore{store: store}, location)
 	if err != nil {
 		return nil, err
 	}
 	store.blobs = blobs
 	store.certificates = certificates
+	store.externalizeTransactions = externalizeTransactions
 	return store, nil
 }
 
-func configureDurability(primary durableAuthority, primaryLocation string) (blobStore, certificateStore, error) {
+func configureDurability(primary durableAuthority, primaryLocation string) (blobStore, certificateStore, bool, error) {
 	secondaryLocation := strings.TrimSpace(os.Getenv("WALGIT_BLOB_SECONDARY_STORE"))
 	requireBlobs, _ := strconv.ParseBool(os.Getenv("WALGIT_REQUIRE_BLOB_REPLICATION"))
 	requireCertificates, _ := strconv.ParseBool(os.Getenv("WALGIT_REQUIRE_DUAL_AUTHORITY"))
 	if secondaryLocation == "" {
 		if requireBlobs || requireCertificates {
-			return nil, nil, errors.New("dual storage is required but WALGIT_BLOB_SECONDARY_STORE is empty")
+			return nil, nil, false, errors.New("dual storage requires WALGIT_BLOB_SECONDARY_STORE")
 		}
-		return primary, nil, nil
+		return primary, nil, false, nil
+	}
+	if !requireBlobs && !requireCertificates {
+		return nil, nil, false, errors.New("WALGIT_BLOB_SECONDARY_STORE requires an explicit replication mode")
 	}
 	primaryIdentity, primaryErr := normalizeBlobLocation(primaryLocation)
 	secondaryIdentity, secondaryErr := normalizeBlobLocation(secondaryLocation)
 	if primaryErr == nil && secondaryErr == nil && primaryIdentity == secondaryIdentity {
-		return nil, nil, errors.New("primary and secondary stores must be different locations")
+		return nil, nil, false, errors.New("primary and secondary stores must be different locations")
 	}
 	secondary, err := openSecondaryAuthority(secondaryLocation)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open secondary store: %w", err)
+		return nil, nil, false, fmt.Errorf("open secondary store: %w", err)
 	}
 	blobs := replicatedBlobStore{stores: []blobStore{primary, secondary}}
-	if !requireCertificates {
-		return blobs, nil, nil
+	if requireCertificates {
+		certificates := replicatedCertificateStore{authorities: []certificateAuthority{primary, secondary}}
+		return blobs, certificates, true, nil
 	}
-	certificates := replicatedCertificateStore{authorities: []certificateAuthority{primary, secondary}}
-	return blobs, certificates, nil
+	return blobs, nil, true, nil
 }
 
 func normalizeBlobLocation(location string) (string, error) {

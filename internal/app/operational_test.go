@@ -403,7 +403,7 @@ func TestMaintenanceCompactsEvictsAndReconciles(t *testing.T) {
 	}
 }
 
-func TestGitHookCrashMatrixPreservesFailedPushSemantics(t *testing.T) {
+func TestGitHookCrashMatrixPreservesAuthoritativeIndex(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
 	}
@@ -419,13 +419,10 @@ func TestGitHookCrashMatrixPreservesFailedPushSemantics(t *testing.T) {
 		name                string
 		failpoints          string
 		generationAfterFail uint64
-		preparedAfterFail   int
 	}{
 		{name: "stage after sync", failpoints: "stage.after_sync", generationAfterFail: 0},
 		{name: "prepared entry rename", failpoints: "commit.after_entry_rename", generationAfterFail: 0},
-		{name: "prepared manifest publish", failpoints: "commit.after_manifest", generationAfterFail: 2},
-		{name: "rollback entry rename", failpoints: "commit.after_manifest,rollback.after_entry_rename", generationAfterFail: 1, preparedAfterFail: 1},
-		{name: "rollback manifest publish", failpoints: "commit.after_manifest,rollback.after_manifest", generationAfterFail: 2},
+		{name: "index response lost", failpoints: "commit.after_manifest", generationAfterFail: 1},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -470,24 +467,18 @@ func TestGitHookCrashMatrixPreservesFailedPushSemantics(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if manifest.Generation != testCase.generationAfterFail || len(manifest.Prepared) != testCase.preparedAfterFail {
-				t.Fatalf("unexpected state after failure: generation=%d prepared=%d manifest=%#v", manifest.Generation, len(manifest.Prepared), manifest)
+			if manifest.Generation != testCase.generationAfterFail || len(manifest.Prepared) != 0 {
+				t.Fatalf("unexpected state after failure: generation=%d manifest=%#v", manifest.Generation, manifest)
 			}
 			if _, err := commandOutput("", "git", "-C", remote, "rev-parse", "--verify", "refs/heads/main"); err == nil {
 				t.Fatal("failed push changed the local ref")
 			}
-			updates := []wal.RefUpdate{{Old: strings.Repeat("0", len(newOID)), New: newOID, Ref: "refs/heads/main"}}
-			if testCase.preparedAfterFail > 0 {
-				if err := backend.Abort("repo", updates); err != nil {
-					t.Fatalf("resume interrupted rollback: %v", err)
+			if testCase.generationAfterFail == 0 {
+				if len(manifest.Refs) != 0 {
+					t.Fatalf("unpublished push changed authoritative refs: %#v", manifest)
 				}
-				manifest, err = backend.Load("repo")
-				if err != nil {
-					t.Fatal(err)
-				}
-			}
-			if len(manifest.Prepared) != 0 || len(manifest.Refs) != 0 {
-				t.Fatalf("failed push remained authoritative: %#v", manifest)
+			} else if manifest.Refs["refs/heads/main"] != newOID {
+				t.Fatalf("published index was not authoritative after response loss: %#v", manifest)
 			}
 			if err := run("", "git", "-C", work, "push", remote, "HEAD:refs/heads/main"); err != nil {
 				t.Fatalf("retry push failed: %v", err)
@@ -503,7 +494,7 @@ func TestGitHookCrashMatrixPreservesFailedPushSemantics(t *testing.T) {
 	}
 }
 
-func TestCommittedHookFailureLeavesDurablePreparedTransaction(t *testing.T) {
+func TestCommittedHookRequiresNoSecondPublication(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
 	}
@@ -543,10 +534,11 @@ func TestCommittedHookFailureLeavesDurablePreparedTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("WALGIT_FAILPOINT", "finalize.before_manifest")
-	// Git has already committed its refs when the committed hook runs, so its
-	// exit status is advisory. The durable prepared record must survive either
-	// client-visible outcome.
-	_ = run("", "git", "-C", work, "push", remote, "HEAD:refs/heads/main")
+	// Finalization is deliberately a no-op: the index publication performed by
+	// the prepared hook is already the durable commit point.
+	if err := run("", "git", "-C", work, "push", remote, "HEAD:refs/heads/main"); err != nil {
+		t.Fatalf("push depended on a second publication: %v", err)
+	}
 	t.Setenv("WALGIT_FAILPOINT", "")
 	local, err := commandOutput("", "git", "-C", remote, "rev-parse", "refs/heads/main")
 	if err != nil || local != expected {
@@ -560,8 +552,8 @@ func TestCommittedHookFailureLeavesDurablePreparedTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Generation != 1 || manifest.Refs["refs/heads/main"] != expected || len(manifest.Prepared) != 1 {
-		t.Fatalf("committed failure was not durably recoverable: %#v", manifest)
+	if manifest.Generation != 1 || manifest.Refs["refs/heads/main"] != expected || len(manifest.Prepared) != 0 {
+		t.Fatalf("single-publication commit was not durable: %#v", manifest)
 	}
 	updates := []wal.RefUpdate{{Old: strings.Repeat("0", len(expected)), New: expected, Ref: "refs/heads/main"}}
 	if err := backend.Finalize("repo", updates); err != nil {
@@ -571,7 +563,7 @@ func TestCommittedHookFailureLeavesDurablePreparedTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(manifest.Prepared) != 0 || manifest.Refs["refs/heads/main"] != expected {
-		t.Fatalf("prepared commit did not finalize cleanly: %#v", manifest)
+	if manifest.Generation != 1 || len(manifest.Prepared) != 0 || manifest.Refs["refs/heads/main"] != expected {
+		t.Fatalf("finalize changed the authoritative commit: %#v", manifest)
 	}
 }

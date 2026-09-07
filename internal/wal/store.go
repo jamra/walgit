@@ -83,10 +83,11 @@ type Manifest struct {
 }
 
 type Store struct {
-	Root         string
-	faults       *storeFaults
-	blobs        blobStore
-	certificates certificateStore
+	Root                    string
+	faults                  *storeFaults
+	blobs                   blobStore
+	certificates            certificateStore
+	externalizeTransactions bool
 }
 
 type storeFaults struct {
@@ -199,10 +200,8 @@ func (s Store) Stage(repoID, objectDir string, updates []RefUpdate) error {
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	var objects []ObjectBlob
-	if s.certificates != nil {
+	if s.certificates != nil || s.externalizeTransactions {
 		objects, err = storeObjectBlobs(objectDir, s.blobStorage())
-	} else {
-		objects, err = maybeStoreObjectBlobs(objectDir, s.blobStorage())
 	}
 	if err != nil {
 		return err
@@ -263,8 +262,10 @@ func (s Store) Commit(repoID string, updates []RefUpdate) (ManifestEntry, Manife
 			_ = os.Remove(filepath.Join(dir, "pending", txID+".wal"))
 			return nil
 		}
-		if err := validatePreparedLocks(m, txID, updates); err != nil {
-			return err
+		if s.certificates != nil {
+			if err := validatePreparedLocks(m, txID, updates); err != nil {
+				return err
+			}
 		}
 		if err := validateUpdates(m, updates); err != nil {
 			return err
@@ -304,10 +305,17 @@ func (s Store) Commit(repoID string, updates []RefUpdate) (ManifestEntry, Manife
 		}
 		m.Generation = generation
 		m.Entries = append(m.Entries, entry)
-		if m.Prepared == nil {
-			m.Prepared = make(map[string]PreparedTransaction)
+		if s.certificates != nil {
+			if m.Prepared == nil {
+				m.Prepared = make(map[string]PreparedTransaction)
+			}
+			m.Prepared[txID] = PreparedTransaction{TransactionID: txID, Generation: generation, CreatedAt: time.Now().UTC(), Updates: updates}
+		} else {
+			// Version 2 manifests may contain records from the superseded
+			// two-publication protocol. A new authoritative publication also
+			// completes those transactions and removes their stale locks.
+			m.Prepared = nil
 		}
-		m.Prepared[txID] = PreparedTransaction{TransactionID: txID, Generation: generation, CreatedAt: time.Now().UTC(), Updates: updates}
 		m, err = publishTransition(s.certificates, repoID, previous, m, []CertificateEntry{{Entry: entry, Updates: updates}})
 		if err != nil {
 			return err
@@ -325,6 +333,11 @@ func (s Store) Commit(repoID string, updates []RefUpdate) (ManifestEntry, Manife
 }
 
 func (s Store) Finalize(repoID string, updates []RefUpdate) error {
+	if s.certificates == nil {
+		// The atomic manifest publication is the only durable commit point.
+		// Git's committed notification only advances the disposable cache.
+		return nil
+	}
 	txID, err := transactionID(updates)
 	if err != nil {
 		return err
@@ -356,6 +369,12 @@ func (s Store) Abort(repoID string, updates []RefUpdate) error {
 	txID, err := transactionID(updates)
 	if err != nil {
 		return err
+	}
+	if s.certificates == nil {
+		// Once the index is published, it remains authoritative even if the
+		// local cache transaction aborts. A retry/reconcile repairs that cache.
+		_ = os.Remove(filepath.Join(s.Root, repoID, "pending", txID+".wal"))
+		return nil
 	}
 	return s.withLock(repoID, func() error {
 		dir := filepath.Join(s.Root, repoID)

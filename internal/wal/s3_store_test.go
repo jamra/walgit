@@ -89,7 +89,7 @@ func TestS3BackendConformance(t *testing.T) {
 	}
 }
 
-func TestS3AbortPublishesCompensatingTransaction(t *testing.T) {
+func TestS3AbortDoesNotRewriteCommittedIndex(t *testing.T) {
 	store := &S3Store{client: newMemoryS3(), bucket: "bucket", prefix: "walgit", timeout: time.Second}
 	if err := store.Initialize("repo", "refs/heads/main", "sha1"); err != nil {
 		t.Fatal(err)
@@ -112,8 +112,8 @@ func TestS3AbortPublishesCompensatingTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Generation != 2 || len(manifest.Entries) != 2 || len(manifest.Refs) != 0 || len(manifest.Prepared) != 0 {
-		t.Fatalf("unexpected compensated S3 manifest: %#v", manifest)
+	if manifest.Generation != 1 || len(manifest.Entries) != 1 || manifest.Refs[updates[0].Ref] != updates[0].New || len(manifest.Prepared) != 0 {
+		t.Fatalf("abort changed the authoritative S3 index: %#v", manifest)
 	}
 	var replayed []RefUpdate
 	_, err = store.ReplayFrom("repo", 0, filepath.Join(t.TempDir(), "objects"), func(_ ManifestEntry, meta EntryMeta) error {
@@ -123,8 +123,8 @@ func TestS3AbortPublishesCompensatingTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(replayed) != 2 || replayed[1].New != updates[0].Old {
-		t.Fatalf("unexpected S3 rollback replay: %#v", replayed)
+	if len(replayed) != 1 || replayed[0].New != updates[0].New {
+		t.Fatalf("unexpected S3 replay after local abort: %#v", replayed)
 	}
 }
 
@@ -264,6 +264,7 @@ func TestS3CoordinatedBatchUsesOneManifestWriteAndCachedMetadata(t *testing.T) {
 	if put, get, head := client.calls(); put != 0 || get != 0 || head != 0 {
 		t.Fatalf("coordinated finalize performed I/O: put=%d get=%d head=%d", put, get, head)
 	}
+	client.resetCalls()
 	if err := store.Abort("repo", third); err != nil {
 		t.Fatal(err)
 	}
@@ -271,39 +272,29 @@ func TestS3CoordinatedBatchUsesOneManifestWriteAndCachedMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rolledBack.Generation != 4 || rolledBack.Refs["refs/heads/c"] != "" {
-		t.Fatalf("coordinated abort did not append compensation: %#v", rolledBack)
+	if rolledBack.Generation != 3 || rolledBack.Refs["refs/heads/c"] != third[0].New {
+		t.Fatalf("abort changed the authoritative index: %#v", rolledBack)
 	}
-	if err := store.Stage("repo", objects, third); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := store.Commit("repo", third); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Abort("repo", third); err != nil {
-		t.Fatal(err)
-	}
-	repeated, err := store.Load("repo")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if repeated.Generation != 6 || repeated.Refs["refs/heads/c"] != "" {
-		t.Fatalf("repeated coordinated abort did not compensate again: %#v", repeated)
+	if put, _, _ := client.calls(); put != 0 {
+		t.Fatalf("abort performed %d S3 writes, want zero", put)
 	}
 }
 
 func TestS3ConcurrentCommitsUseManifestCAS(t *testing.T) {
-	store := &S3Store{client: newMemoryS3(), bucket: "bucket", prefix: "walgit", timeout: time.Second}
-	if err := store.Initialize("repo", "refs/heads/main", "sha1"); err != nil {
+	client := newMemoryS3()
+	initializer := &S3Store{client: client, bucket: "bucket", prefix: "walgit", timeout: time.Second}
+	if err := initializer.Initialize("repo", "refs/heads/main", "sha1"); err != nil {
 		t.Fatal(err)
 	}
 	objects := t.TempDir()
 	const writers = 12
 	updates := make([][]RefUpdate, writers)
+	stores := make([]*S3Store, writers)
 	for i := range updates {
 		oid := strings.Repeat(string("abcdef"[i%6]), 40)
 		updates[i] = []RefUpdate{{Old: strings.Repeat("0", 40), New: oid, Ref: "refs/heads/branch-" + string(rune('a'+i))}}
-		if err := store.Stage("repo", objects, updates[i]); err != nil {
+		stores[i] = &S3Store{client: client, bucket: "bucket", prefix: "walgit", timeout: time.Second}
+		if err := stores[i].Stage("repo", objects, updates[i]); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -313,7 +304,7 @@ func TestS3ConcurrentCommitsUseManifestCAS(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, _, err := store.Commit("repo", updates[i])
+			_, _, err := stores[i].Commit("repo", updates[i])
 			errs <- err
 		}(i)
 	}
@@ -324,12 +315,107 @@ func TestS3ConcurrentCommitsUseManifestCAS(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	m, err := store.Load("repo")
+	m, err := initializer.Load("repo")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if m.Generation != writers || len(m.Refs) != writers {
 		t.Fatalf("S3 CAS lost updates: %#v", m)
+	}
+}
+
+func TestS3CommitUsesOneAuthoritativeIndexPublication(t *testing.T) {
+	client := newMemoryS3()
+	store := &S3Store{client: client, bucket: "bucket", prefix: "walgit", timeout: time.Second}
+	if err := store.Initialize("repo", "refs/heads/main", "sha1"); err != nil {
+		t.Fatal(err)
+	}
+	updates := []RefUpdate{{Old: strings.Repeat("0", 40), New: strings.Repeat("a", 40), Ref: "refs/heads/main"}}
+	if err := store.Stage("repo", t.TempDir(), updates); err != nil {
+		t.Fatal(err)
+	}
+	client.resetCalls()
+	if _, manifest, err := store.Commit("repo", updates); err != nil {
+		t.Fatal(err)
+	} else if manifest.Generation != 1 || len(manifest.Prepared) != 0 {
+		t.Fatalf("unexpected committed index: %#v", manifest)
+	}
+	if put, get, head := client.calls(); put != 1 || get != 1 || head != 0 {
+		t.Fatalf("commit calls: put=%d get=%d head=%d, want one GET and one CAS PUT", put, get, head)
+	}
+	client.resetCalls()
+	if err := store.Finalize("repo", updates); err != nil {
+		t.Fatal(err)
+	}
+	if put, get, head := client.calls(); put != 0 || get != 0 || head != 0 {
+		t.Fatalf("finalize performed remote I/O: put=%d get=%d head=%d", put, get, head)
+	}
+}
+
+func TestS3CrashBoundariesLeaveIndexRecoverable(t *testing.T) {
+	for _, testCase := range []struct {
+		name               string
+		failpoint          string
+		stage              bool
+		wantWAL            bool
+		wantGeneration     uint64
+		wantCommitResponse bool
+	}{
+		{name: "before WAL upload", failpoint: "s3.stage.before_wal_upload", stage: true},
+		{name: "after WAL upload", failpoint: "s3.stage.after_wal_upload", stage: true, wantWAL: true},
+		{name: "before index CAS", failpoint: "s3.commit.before_index_cas", wantWAL: true},
+		{name: "after index CAS", failpoint: "s3.commit.after_index_cas", wantWAL: true, wantGeneration: 1, wantCommitResponse: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			client := newMemoryS3()
+			store := &S3Store{client: client, bucket: "bucket", prefix: "walgit", timeout: time.Second}
+			if err := store.Initialize("repo", "refs/heads/main", "sha1"); err != nil {
+				t.Fatal(err)
+			}
+			updates := []RefUpdate{{Old: strings.Repeat("0", 40), New: strings.Repeat("a", 40), Ref: "refs/heads/main"}}
+			txID, err := transactionID(updates)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !testCase.stage {
+				if err := store.Stage("repo", t.TempDir(), updates); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("WALGIT_FAILPOINT", testCase.failpoint)
+			if testCase.stage {
+				err = store.Stage("repo", t.TempDir(), updates)
+			} else {
+				_, _, err = store.Commit("repo", updates)
+			}
+			if err == nil {
+				t.Fatal("injected crash boundary unexpectedly succeeded")
+			}
+			t.Setenv("WALGIT_FAILPOINT", "")
+			client.mu.Lock()
+			_, walExists := client.objects[store.key("repo", "transactions/"+txID+".wal")]
+			client.mu.Unlock()
+			if walExists != testCase.wantWAL {
+				t.Fatalf("WAL existence=%v, want %v", walExists, testCase.wantWAL)
+			}
+			manifest, err := store.Load("repo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if manifest.Generation != testCase.wantGeneration {
+				t.Fatalf("generation=%d, want %d", manifest.Generation, testCase.wantGeneration)
+			}
+			if testCase.wantCommitResponse {
+				client.resetCalls()
+				entry, retried, err := store.Commit("repo", updates)
+				if err != nil || entry.Generation != 1 || retried.Generation != 1 {
+					t.Fatalf("idempotent retry: entry=%#v manifest=%#v err=%v", entry, retried, err)
+				}
+				if put, _, _ := client.calls(); put != 0 {
+					t.Fatalf("retry after lost success response performed %d writes", put)
+				}
+			}
+		})
 	}
 }
 
@@ -361,9 +447,47 @@ func TestS3StageStreamsWithoutLocalFileAndRequestsSHA256(t *testing.T) {
 	}
 }
 
-func TestS3BlobBackedStageStoresTinyWALAndReplays(t *testing.T) {
+func TestS3DefaultLargeStageKeepsOneMonolithicWALObject(t *testing.T) {
 	client := newMemoryS3()
 	store := &S3Store{client: client, bucket: "bucket", prefix: "walgit", timeout: time.Second}
+	if err := store.Initialize("repo", "refs/heads/main", "sha1"); err != nil {
+		t.Fatal(err)
+	}
+	objects := filepath.Join(t.TempDir(), "objects")
+	if err := os.MkdirAll(filepath.Join(objects, "pack"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("x"), blobExternalizeThreshold)
+	if err := os.WriteFile(filepath.Join(objects, "pack", "objects.pack"), payload, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	updates := []RefUpdate{{Old: strings.Repeat("0", 40), New: strings.Repeat("a", 40), Ref: "refs/heads/main"}}
+	if err := store.Stage("repo", objects, updates); err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	walObjects := 0
+	blobObjects := 0
+	for key, object := range client.objects {
+		if strings.Contains(key, "/transactions/") {
+			walObjects++
+			if len(object.data) <= len(payload) {
+				t.Fatalf("monolithic WAL bytes=%d, payload=%d", len(object.data), len(payload))
+			}
+		}
+		if strings.Contains(key, "/.walgit-blobs/") {
+			blobObjects++
+		}
+	}
+	if walObjects != 1 || blobObjects != 0 {
+		t.Fatalf("WAL objects=%d blob objects=%d, want 1 and 0", walObjects, blobObjects)
+	}
+}
+
+func TestS3BlobBackedStageStoresTinyWALAndReplays(t *testing.T) {
+	client := newMemoryS3()
+	store := &S3Store{client: client, bucket: "bucket", prefix: "walgit", timeout: time.Second, externalizeTransactions: true}
 	if err := store.Initialize("repo", "refs/heads/main", "sha1"); err != nil {
 		t.Fatal(err)
 	}

@@ -60,15 +60,15 @@ func TestCommitRejectsManifestConflict(t *testing.T) {
 	}
 }
 
-func TestAbortAppendsCompensatingTransaction(t *testing.T) {
+func TestAbortDoesNotRewriteCommittedIndex(t *testing.T) {
 	store, id, objects, updates := testTransaction(t)
 	if err := store.Stage(id, objects, updates); err != nil {
 		t.Fatal(err)
 	}
 	if _, manifest, err := store.Commit(id, updates); err != nil {
 		t.Fatal(err)
-	} else if len(manifest.Prepared) != 1 {
-		t.Fatalf("commit did not record prepared transaction: %#v", manifest.Prepared)
+	} else if len(manifest.Prepared) != 0 {
+		t.Fatalf("commit retained superseded prepared state: %#v", manifest.Prepared)
 	}
 	if err := store.Abort(id, updates); err != nil {
 		t.Fatal(err)
@@ -80,8 +80,8 @@ func TestAbortAppendsCompensatingTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Generation != 2 || len(manifest.Entries) != 2 || len(manifest.Prepared) != 0 || len(manifest.Refs) != 0 {
-		t.Fatalf("unexpected compensated manifest: %#v", manifest)
+	if manifest.Generation != 1 || len(manifest.Entries) != 1 || len(manifest.Prepared) != 0 || manifest.Refs[updates[0].Ref] != updates[0].New {
+		t.Fatalf("abort changed authoritative manifest: %#v", manifest)
 	}
 	var applied []RefUpdate
 	_, err = store.ReplayFrom(id, 0, filepath.Join(t.TempDir(), "objects"), func(_ ManifestEntry, meta EntryMeta) error {
@@ -91,12 +91,12 @@ func TestAbortAppendsCompensatingTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(applied) != 2 || applied[1].Old != updates[0].New || applied[1].New != updates[0].Old {
-		t.Fatalf("unexpected replayed compensation: %#v", applied)
+	if len(applied) != 1 || applied[0].New != updates[0].New {
+		t.Fatalf("unexpected replay after local abort: %#v", applied)
 	}
 }
 
-func TestPreparedTransactionLocksTouchedRefsUntilFinalized(t *testing.T) {
+func TestPublishedIndexAllowsNextExpectedTransition(t *testing.T) {
 	store, id, objects, first := testTransaction(t)
 	if err := store.Stage(id, objects, first); err != nil {
 		t.Fatal(err)
@@ -108,14 +108,8 @@ func TestPreparedTransactionLocksTouchedRefsUntilFinalized(t *testing.T) {
 	if err := store.Stage(id, objects, second); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.Commit(id, second); err == nil || !strings.Contains(err.Error(), "locked by prepared transaction") {
-		t.Fatalf("expected prepared ref lock, got %v", err)
-	}
-	if err := store.Finalize(id, first); err != nil {
-		t.Fatal(err)
-	}
 	if _, _, err := store.Commit(id, second); err != nil {
-		t.Fatalf("commit after finalize failed: %v", err)
+		t.Fatalf("commit after authoritative predecessor failed: %v", err)
 	}
 }
 
